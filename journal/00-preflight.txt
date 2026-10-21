@@ -1,0 +1,277 @@
+STEP 00 - Pre-flight and image research
+
+What this file is: phase A discovery and image research for the ticketing
+project. Updated 2026-10-20 19:04 CEST. The reader will find the real host
+state, the nginx/container mismatch, how the sudo block was lifted, and the
+osTicket vs FreeScout comparison that led to the decision.
+
+STEP
+A1 and A2. Read-only pre-flight of the homelab host, then research of the
+current osTicket and FreeScout Docker images. No container, file or service
+on the existing homelab was changed.
+
+CONTEXT
+The host is an old laptop running Arch Linux, headless, 2 cores, 3.7 GiB RAM.
+It already runs a Samba AD DC, Docker with seven homelab containers, and an
+nginx reverse proxy. The new ticket system must use the existing shared
+Docker network and must not publish a new host port. The project lives in a
+new repository at ~/ticket-system.
+
+The first instruction said nginx runs on the host and to use nginx -t plus
+systemctl reload nginx. That turned out to be false for this machine. The
+second instruction said tickets.home.arpa is the same zone as the other
+services. That is also not true today. Both facts changed the plan.
+
+WHAT I TRIED
+1. Read the existing audit and changelog:
+   ~/homelab-audit/2026-10-20/00-SUMMARY.txt
+   tail -n 120 ~/homelab-audit/2026-10-20/CHANGELOG.txt
+   The requested POST-FIX-REPORT.txt does not exist. The replacement evidence
+   is in ~/homelab-audit/2026-10-20/fixes/ and in CHANGELOG.txt.
+
+2. Read the live Compose files and nginx config:
+   cat ~/homelab/nginx/compose.yml
+   cat ~/homelab/nginx/nginx.conf
+   cat ~/jellyfin/compose.yml
+   cat ~/searxng/compose.yml
+   cat ~/homelab/monitoring/*/compose.yml
+
+3. Measured the host as the login user:
+   docker ps
+   docker network ls
+   free -h
+   df -h /
+   ss -tln
+   systemctl is-active docker nginx
+   systemctl is-enabled docker nginx
+   command -v nginx
+   ls -la /etc/nginx
+
+4. Measured Samba and LDAP read-only:
+   samba-tool domain info 127.0.0.1
+   ldapsearch -x -H ldap://127.0.0.1 -s base
+   ldbsearch -H ldap://127.0.0.1 -s base
+   samba-tool dns query 127.0.0.1 home.arpa @ ALL
+
+5. Confirmed outbound network:
+   ping -c 2 -W 3 github.com
+
+6. After the sudo rule was added, measured Docker properly:
+   sudo -n docker ps
+   sudo -n docker network ls
+   sudo -n docker network inspect homelab
+   sudo -n docker stats --no-stream
+   sudo -n docker compose ls
+   sudo -n docker exec homelab-nginx-nginx-1 nginx -t
+   sudo -n docker exec homelab-nginx-nginx-1 nginx -T
+
+7. Researched the application images from primary sources:
+   https://github.com/osTicket/osTicket/releases/tag/v1.18.4
+   https://forum.osticket.com/d/107244-how-to-setup-osticket-for-docker
+   https://hub.docker.com/r/osticket/osticket
+   https://hub.docker.com/r/hlhd/osticket
+   https://github.com/HomeLabHD/osticket
+   https://github.com/freescout-help-desk/freescout/releases/tag/1.8.248
+   https://hub.docker.com/r/nfrastack/freescout
+   https://freescout.net/module/ldap/
+
+WHAT WENT WRONG
+
+Problem 1: Docker socket permission.
+Command:
+  docker ps
+Output:
+  permission denied while trying to connect to the docker API at
+  unix:///var/run/docker.sock
+Cause:
+  ls -l /var/run/docker.sock showed srw-rw---- root:docker.
+  groups showed only wheel. getent group docker showed docker:x:968: with no
+  members. The login user is intentionally not in the docker group.
+The first attempt to check for root also failed:
+  sudo -n true
+  sudo: je vyžadováno heslo
+
+Problem 2: The sudo test gave a false negative.
+After the user created /etc/sudoers.d/90-ticket-project, this still failed:
+  sudo -n true
+  sudo: je vyžadováno heslo
+That looked like the rule was missing. It was not. The rule is scoped to
+specific binaries and /usr/bin/true is not one of them. The real test worked:
+  sudo -n docker ps
+  ... seven containers, all healthy ...
+
+Problem 3: "nginx runs here" was not true in the sense of a host service.
+Command:
+  systemctl is-active nginx
+  inactive
+  systemctl is-enabled nginx
+  not-found
+  command -v nginx
+  (no output)
+  ls -la /etc/nginx
+  only mime.types
+Port 80 and 443 were still listening. The owner was the container
+homelab-nginx-nginx-1, image nginx:1.30.6-alpine3.24. The host has no nginx
+binary, no unit and no full config. The real config is
+~/homelab/nginx/nginx.conf, bind-mounted read-only into the container.
+
+Problem 4: ldapsearch is not installed.
+Command:
+  ldapsearch -x -H ldap://127.0.0.1 -s base
+Output:
+  bash: ldapsearch: command not found
+A fallback with ldbsearch also failed:
+  ldbsearch -H ldap://127.0.0.1 -s base
+  search error - LDAP error 1 LDAP_OPERATIONS_ERROR -
+  <00002020: Operation unavailable without authentication>
+So the base DN could not be read in A1. It is deferred to C1.
+
+Problem 5: DNS query needs credentials.
+Command:
+  samba-tool dns query 127.0.0.1 home.arpa @ ALL
+Output:
+  Password for [AD\...]:
+  Failed to bind ... NT_STATUS_LOGON_FAILURE
+  ERROR: Connecting to DNS RPC server 127.0.0.1 failed ...
+This is expected without an AD account. No DNS record was changed. The check
+will be repeated in B5 after asking for approval.
+
+Problem 6: The audit file named in the brief was missing.
+  find ~/homelab-audit -name "POST-FIX*"
+  (no output)
+I used 00-SUMMARY.txt, the last CHANGELOG entries and fixes/*.txt instead.
+This is a documentation gap in the old project, not a host fault.
+
+WHAT I ASSUMED WRONGLY
+- I assumed nginx was a systemd service because the brief said so. It is a
+  container. The backup, test and reload commands must target the container.
+- I assumed tickets.home.arpa was in the same DNS zone as the other homelab
+  names. The live vhosts are jellyfin.home, search.home, grafana.home,
+  prometheus.home and alerts.home, with .local aliases. The AD zone is
+  ad.home.arpa. No zone currently serves home.arpa. This will be resolved in
+  B5 and may end up as tickets.ad.home.arpa or a hosts entry.
+- I assumed ldapsearch was available on the host. It is not.
+- I assumed an image under the Docker Hub namespace osticket/osticket would
+  be an official project image. It is an automated build last pushed in 2020.
+- I assumed a scoped sudoers rule would make sudo -n true pass. It does not,
+  because true is not in the command list. Test the command you need.
+
+DEAD ENDS
+- Running docker as the login user. The socket is root:docker and the user is
+  not a member. Joining the docker group would be root-equivalent anyway and
+  would widen the account, so I did not do it.
+- Using sudo -n true as a general root check. It is the wrong test for a
+  scoped rule.
+- Reading the AD base DN anonymously with ldbsearch. The server rejects it.
+- Querying the Samba DNS zone without credentials. The RPC call fails with
+  NT_STATUS_LOGON_FAILURE.
+- Considering osticket/osticket (last push 2020-08-04, only latest),
+  campbellsoftwaresolutions/osticket (1.12, 2020) and
+  devinsolutions/osticket (archived repo, 1.17.5, 2024). All are too old for
+  a 2026 deployment with current security patches.
+- Considering FreeScout. The image is well maintained, but the LDAP module
+  costs from $17.99 and Phase C needs LDAP. The user chose osTicket.
+
+HOW I DIAGNOSED IT
+- Docker permission: ls -l /var/run/docker.sock, groups, getent group docker.
+- Port ownership: ss -tln showed 80 and 443, ps showed docker-proxy with
+  container IP 172.20.0.8. docker network inspect homelab confirmed that IP
+  belongs to homelab-nginx-nginx-1.
+- nginx reality: command -v nginx, systemctl status, /etc/nginx contents,
+  then docker exec ... nginx -T to read the effective config.
+- Shared network: docker network inspect homelab showed subnet
+  172.20.0.0/16, gateway 172.20.0.1 and all seven containers.
+- Memory: docker stats plus free -h, not guesses from the image size.
+- Image state: release pages, Docker Hub API for last push and tags, GitHub
+  API for repository archive status, and the osTicket forum post from
+  2025-12-11 where the project says it has no official Docker builds.
+
+HOW I FIXED IT
+- Temporary sudo rule. The user created
+  /etc/sudoers.d/90-ticket-project with NOPASSWD for /usr/bin/docker,
+  /usr/bin/samba-tool, /usr/bin/systemctl, /usr/bin/systemd-run,
+  /usr/bin/cp, /usr/bin/mv, /usr/bin/install, /usr/bin/chmod,
+  /usr/bin/chown, /usr/bin/mkdir and /usr/bin/tee. It is scoped, not ALL.
+  This is still root-equivalent because docker can mount the host filesystem.
+  It is a lab trade-off, not a production pattern. It must be removed at the
+  end of the project and the removal must be logged.
+- nginx plan changed to the container:
+  backup ~/homelab/nginx/nginx.conf
+  docker exec homelab-nginx-nginx-1 nginx -t
+  docker exec homelab-nginx-nginx-1 nginx -s reload
+  The config is a read-only bind mount, so the host file is the source.
+- LDAP and DNS checks were deferred, not faked. ldapsearch will be installed
+  after approval in C1. The DNS zone will be checked with credentials in B5.
+- The application choice is option A: osTicket 1.18.4 from
+  hlhd/osticket:v1.18.4. The image is rootless, includes the LDAP plugin and
+  is current as of 2026-09-12. It is a small community project with 3 GitHub
+  stars, so B2 must prove it works. If it fails, the fallback is a local
+  build from the official osTicket 1.18.4 zip, not a switch to FreeScout.
+
+HOW I VERIFIED IT
+Docker after the sudo rule:
+  NAMES                                   IMAGE                                  STATUS
+  homelab-nginx-nginx-1                   nginx:1.30.6-alpine3.24                Up (healthy)
+  homelab-jellyfin-jellyfin-1             jellyfin/jellyfin:10.11.11             Up (healthy)
+  homelab-searxng-searxng-1               searxng/searxng:2026.10.19-81371861f   Up (healthy)
+  homelab-grafana-grafana-1               grafana/grafana:13.2.4                 Up (healthy)
+  homelab-prometheus-prometheus-1         prom/prometheus:v3.15.0                Up (healthy)
+  homelab-alertmanager-alertmanager-1     prom/alertmanager:v0.34.1              Up (healthy)
+  homelab-node-exporter-node-exporter-1   prom/node-exporter:v1.12.1             Up (healthy)
+Only nginx publishes ports: 0.0.0.0:80->80, 0.0.0.0:443->443.
+
+Network:
+  homelab  797f569a14de  bridge  local  172.20.0.0/16
+  nginx 172.20.0.8, prometheus 172.20.0.2, node-exporter 172.20.0.3,
+  alertmanager 172.20.0.4, grafana 172.20.0.5, searxng 172.20.0.6,
+  jellyfin 172.20.0.7.
+
+Memory at 18:47 CEST:
+  nginx 4.6 MiB, jellyfin 266.6 MiB, searxng 156.0 MiB, grafana 362.9 MiB,
+  alertmanager 45.6 MiB, node-exporter 21.4 MiB, prometheus 54.0 MiB.
+  free -h: total 3.7 GiB, used 1.9 GiB, available 1.8 GiB.
+  df -h /: 109G total, 14G used, 90G free.
+
+nginx:
+  docker exec homelab-nginx-nginx-1 nginx -t
+  nginx: the configuration file /etc/nginx/nginx.conf syntax is ok
+  nginx: configuration file /etc/nginx/nginx.conf test is successful
+
+Samba:
+  samba-tool domain info 127.0.0.1
+  Forest: ad.home.arpa
+  Domain: ad.home.arpa
+  DC name: dc1.ad.home.arpa
+  (no credentials were used, no account was created)
+
+Outbound:
+  ping -c 2 github.com: 2 packets transmitted, 2 received, 0% loss, 23 ms.
+
+Image research:
+  osTicket 1.18.4, released 2026-06-17.
+  osTicket has no official Docker image. Forum post 2025-12-11:
+  "We do not have official Docker builds; this is coming for v2.0."
+  osticket/osticket last push 2020-08-04, tag latest only.
+  hlhd/osticket v1.18.4, build 2026-09-12, source HomeLabHD/osticket,
+  rootless, LDAP plugin bundled, 3 GitHub stars.
+  FreeScout 1.8.248, released 2026-10-17.
+  nfrastack/freescout 2.2.19, build 2026-10-17, bundles FreeScout 1.8.248.
+  FreeScout LDAP module: paid, from $17.99, lifetime license.
+
+ROLLBACK
+No change was made to the homelab services, containers, network, Samba,
+nginx config or DNS. The only new things on the host are:
+  ~/ticket-system (new repository, no commit yet)
+  /etc/sudoers.d/90-ticket-project (temporary, remove at the end)
+
+To undo the repository: rm -rf ~/ticket-system, only with explicit approval.
+To undo the sudo rule: sudo rm /etc/sudoers.d/90-ticket-project, then check
+that sudo -n docker ps fails again. Do not remove it before the project work
+is finished.
+
+LESSON LEARNED
+Read the host before trusting the brief. "nginx runs here" can mean a
+container, and "same zone" can mean a name that does not resolve. A scoped
+sudoers rule needs a scoped test, because sudo -n true will lie to you.
+Finally, a Docker Hub namespace that matches the product name is not proof of
+an official image. The last push date is the fact that matters.

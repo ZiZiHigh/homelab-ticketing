@@ -1,0 +1,44 @@
+# Environment files and generated secrets
+.env
+.env.*
+!.env.example
+!**/.env.example
+compose/.env
+
+# Local Compose secrets. The directory keeps only its .gitignore in Git.
+compose/secrets/*
+!compose/secrets/.gitignore
+
+# Keys, certificates and password files
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+restic-password
+*password*
+*passwd*
+
+# The rotation journal is documentation, not a secret value. Keep it tracked.
+!journal/05-admin-password-rotation.txt
+
+# Runtime data and database dumps
+data/
+compose/data/
+backups/
+*.sql
+*.sql.gz
+
+# Logs and local backups
+*.log
+*.bak
+*.bak-*
+*.tmp
+
+# Python and editor noise
+__pycache__/
+*.pyc
+.venv/
+.idea/
+.vscode/
+.DS_Store

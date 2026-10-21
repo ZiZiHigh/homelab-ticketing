@@ -1,0 +1,643 @@
+STEP 02 - Build, start and verify the osTicket Compose stack
+
+CONTEXT
+The image audit was finished. The application image and the MariaDB image
+were already pinned by digest. The next job was to build the Compose stack,
+start it inside the homelab Docker network, and verify that the application
+could install itself and serve the agent login before I touched nginx or DNS.
+
+The host is the same old laptop. It runs the existing 7 homelab containers
+and the Samba AD DC. The reverse proxy is the container
+`homelab-nginx-nginx-1`. The shared network is `172.20.0.0/16`. The host has 3.7 GiB RAM and the stack has to fit
+next to the existing services. The new stack may not publish a host port.
+The database must not be reachable from other containers on the `homelab`
+network.
+
+The public name is still `http://tickets.home.arpa`, but DNS and the nginx
+vhost are not part of this step. The internal test used the Compose service
+name `osticket:8080`. HTTPS and email remain out of scope.
+
+The application image is:
+
+    hlhd/osticket:v1.18.4@sha256:d115c1a73cafb790ca730e8805178c92484974ceab4f6109dd2a6c71b55e68f4
+
+The database image is:
+
+    mariadb:11.8.9@sha256:f16d7a344413e519dff518f27bdb221388f84b0d274c97c4fb5f2cb0dc1b34fa
+
+I used `sudo -n docker` because the normal login user is not in the docker
+group. The project sudo rule allows Docker without a password. All repository
+files are written in English. Commands and outputs below are copied from the
+session. Secret values are not included.
+
+WHAT I TRIED
+
+B1 - Compose files and local secrets
+
+1. Checked the pre-start state. Before this step there were no ticket
+   containers, no ticket networks and no ticket volumes:
+
+       sudo -n docker ps -a --filter 'name=ticket-system'
+       sudo -n docker network ls --filter 'name=ticket-system'
+       sudo -n docker volume ls --filter 'name=ticket-system'
+
+   All three commands returned no rows. The host was at 1726 MiB used and
+   2063 MiB available according to `free -m`.
+
+2. Backed up `.gitignore` and added the secret ignore rules. The file now
+   ignores `compose/secrets/*` and keeps only `compose/secrets/.gitignore`
+   in Git. The backup is `.gitignore.bak-2026-10-21-1231`.
+
+3. Created the stack files:
+
+       compose/docker-compose.yml
+       compose/.env.example
+       compose/.env
+       compose/init-secrets.sh
+       compose/secrets/.gitignore
+       compose/php-hardening.ini
+       compose/php-fpm.conf
+       compose/mariadb.cnf
+       compose/README.md
+
+   The app service is attached to `homelab` and to a new internal `backend`
+   network. The database is attached only to `backend`. The database volume
+   has the explicit name `ticket-system-db-data`. There is no `ports:` key
+   anywhere.
+
+4. The app container uses:
+
+       user: "1000:1000"
+       read_only: true
+       cap_drop: [ALL]
+       security_opt: [no-new-privileges=true]
+       mem_limit: 900m
+       cpus: "1.0"
+       pids_limit: 256
+       tmpfs:
+         - /run/osticket:rw,noexec,nosuid,size=64m,uid=1000,gid=0,mode=770
+         - /tmp:rw,noexec,nosuid,size=64m,mode=1777
+
+   The database container uses `mem_limit: 512m`, `cpus: "1.0"` and
+   `no-new-privileges=true`. It does not drop all capabilities because the
+   MariaDB entrypoint needs to prepare the data directory and switch to the
+   `mysql` user during the first start.
+
+5. Generated the four local secret files with `compose/init-secrets.sh`.
+   The script uses `umask 077`, writes no trailing newline, and refuses to
+   overwrite a non-empty file. The files are mode 600:
+
+       600 32 compose/secrets/admin_password.txt
+       600 64 compose/secrets/db_password.txt
+       600 64 compose/secrets/db_root_password.txt
+       600 64 compose/secrets/install_secret.txt
+
+   The script printed only the paths. It did not print any secret value.
+   The admin username became `homelab-admin` later in B2. The password stayed
+   in `compose/secrets/admin_password.txt`.
+
+6. Checked that Git ignores the local files:
+
+       git check-ignore -v compose/.env compose/secrets/db_password.txt
+
+   The `.env` file was ignored by `.gitignore` line 6. The secret files were
+   ignored by `compose/secrets/.gitignore` line 1. The tracked candidates
+   still include `.env.example`, `docker-compose.yml`, the three config files
+   and the script.
+
+7. Validated the Compose file:
+
+       cd ~/ticket-system/compose
+       sudo -n docker compose config --quiet
+       sudo -n docker compose config --services
+       sudo -n docker compose config --images
+       sudo -n docker compose config --volumes
+
+   The services were `db` and `osticket`. The images were the two digest-pinned
+   references above. The volume was `db_data`. `docker compose config` showed
+   `PortBindings` as an empty object and no `ports:` entry. It also showed
+   `read_only: true`, `cap_drop: [ALL]`, `mem_limit` 536870912 for the DB and
+   943718400 for the app, and the internal network `ticket-system_backend`.
+
+8. Tested the PHP-FPM config against the real image:
+
+       sudo -n docker run --rm \
+         -v "$PWD/php-fpm.conf:/usr/local/etc/php-fpm.d/zz-osticket.conf:ro" \
+         --entrypoint php-fpm hlhd/osticket:v1.18.4 -t
+
+   Output:
+
+       NOTICE: configuration file /usr/local/etc/php-fpm.conf test is successful
+
+9. Checked the hardening values from the same image:
+
+       sudo -n docker run --rm \
+         -v "$PWD/php-hardening.ini:/usr/local/etc/php/conf.d/zz-hardening.ini:ro" \
+         --entrypoint php hlhd/osticket:v1.18.4 -i
+
+   The relevant values were:
+
+       allow_url_fopen => Off => Off
+       allow_url_include => Off => Off
+       display_errors => Off => Off
+       display_startup_errors => Off => Off
+       expose_php => Off => Off
+       log_errors => On => On
+       pcre.jit => Off => Off
+       session.cookie_httponly => On => On
+       session.cookie_samesite => Lax => Lax
+       session.use_strict_mode => On => On
+
+10. Tried the read-only nginx test before starting the stack. I mounted the
+    hardening ini and the FPM pool, started the image with `--read-only`,
+    `--cap-drop ALL` and tmpfs, then ran `nginx -t` and `php-fpm -t`.
+
+    The first test failed:
+
+       mkdir: can't create directory '/run/osticket/nginx/': Permission denied
+       mkdir: can't create directory '/run/osticket/nginx/': Permission denied
+       mkdir: can't create directory '/run/osticket/nginx/': Permission denied
+       mkdir: can't create directory '/run/osticket/nginx/': Permission denied
+       mkdir: can't create directory '/run/osticket/nginx/': Permission denied
+       mkdir: can't create directory '/run/osticket/php': Permission denied
+       rc=1
+
+    I checked the mount and the image user. The container runs as uid 1000,
+    but Docker creates a tmpfs as root:root mode 755 by default. The image's
+    own `/run/osticket` is owned by uid 1000 and is group-writable, but the
+    tmpfs hides that ownership. The fix was to pass the ownership and mode in
+    the tmpfs options:
+
+       /run/osticket:rw,noexec,nosuid,size=64m,uid=1000,gid=0,mode=770
+       /tmp:rw,noexec,nosuid,size=64m,mode=1777
+
+    The retest showed:
+
+       drwxrwx---    2 osticket root            40 ... /run/osticket
+       drwxrwxrwt    2 root     root            40 ... /tmp
+       -rw-r--r--    1 osticket osticket         0 ... /run/osticket/probe
+       rc=0
+
+    After the change, the read-only nginx and FPM test passed. The only line
+    was the known alert:
+
+       nginx: [alert] could not open error log file: open() "/var/lib/nginx/logs/error.log" failed (30: Read-only file system)
+       nginx: the configuration file /run/osticket/nginx.conf syntax is ok
+       nginx: configuration file /run/osticket/nginx.conf test is successful
+       NOTICE: configuration file /usr/local/etc/php-fpm.conf test is successful
+
+B2 - First start
+
+11. Started the stack from `~/ticket-system/compose`:
+
+        date -Is
+        sudo -n docker compose up -d
+
+    The first timestamp was `2026-10-21T12:38:55+02:00`. Docker created
+    `ticket-system_backend` and `ticket-system-db-data`, started the database,
+    waited for its healthcheck, then started the application. The database
+    became healthy and the app container started.
+
+12. The app did not become healthy. The health status went from `starting` to
+    `unhealthy`, then the container restarted. At 12:40:47 the state was:
+
+        ticket-system-osticket-1 ... Restarting (1) 41 seconds ago
+
+    `docker inspect` reported `RestartCount=11`. The DB stayed healthy.
+
+13. Read the app log. The repeating error was:
+
+        [install-seed] running osTicket Installer (schema + admin user + defaults)
+        [install-seed] install FAILED:
+          - username: Bad username
+
+    The entrypoint was loading the three file-based secrets correctly. The
+    failure was after the database connection, during the installer's form
+    validation.
+
+14. Checked the database before changing anything. `SHOW TABLES` returned no
+    rows and `SELECT ... FROM ost_staff` failed with:
+
+        ERROR 1146 (42S02) at line 1: Table 'osticket.ost_staff' doesn't exist
+
+    The failed install had not left a partial schema or a partial admin row.
+    The database volume was fresh and safe to reuse.
+
+15. Searched the image source for the error string:
+
+        grep -RIn "Bad username" /var/www/html
+
+    The hit was in `setup_hidden/inc/class.installer.php`. The relevant code
+    was:
+
+        if(!$this->errors['username'] && in_array(strtolower($vars['username']),array('admin','admins','username','osticket')))
+            $this->errors['username']=__('Bad username');
+
+    The username validator itself accepts `admin` because it has more than two
+    characters and only valid characters. The separate blocklist rejects the
+    exact predictable names `admin`, `admins`, `username` and `osticket`.
+    Because the check uses `strtolower`, changing the case to `Admin` would
+    not help.
+
+16. Backed up the local environment files:
+
+        cp -a .env .env.bak-2026-10-21-1241
+        cp -a .env.example .env.example.bak-2026-10-21-1241
+
+    Changed `ADMIN_USER=admin` to `ADMIN_USER=homelab-admin` in both files and
+    added a comment that explains the blocklist. The rest of the configuration
+    stayed unchanged.
+
+17. Ran `docker compose config --quiet`, then `docker compose up -d` again.
+    Compose recreated only the application container. The database container
+    stayed running. The app became healthy at `12:42:02`. The log showed:
+
+        [install-seed] osTicket installed: schema loaded, admin "homelab-admin" created.
+
+18. Verified the running system. The checks are listed in the next section,
+    because the verification is the part that matters for the next step.
+
+WHAT WENT WRONG
+
+Problem 1: the read-only tmpfs mount was not writable by uid 1000.
+
+Exact error:
+
+    mkdir: can't create directory '/run/osticket/nginx/': Permission denied
+    mkdir: can't create directory '/run/osticket/php': Permission denied
+    rc=1
+
+Cause: Docker mounts an anonymous tmpfs as root:root with mode 755 unless
+the mount options say otherwise. The image's normal `/run/osticket` is owned
+by uid 1000 and is group-writable, but a tmpfs mount replaces that directory
+with a new empty filesystem. The entrypoint therefore could not create its
+nginx temp directories or its PHP ini.
+
+Fix: add `uid=1000,gid=0,mode=770` to the `/run/osticket` tmpfs and
+`mode=1777` to `/tmp`. The test then showed the directory owned by
+`osticket:root` with mode 770 and the probe file was created.
+
+Problem 2: the first install used a username that osTicket rejects.
+
+Exact error:
+
+    [install-seed] install FAILED:
+      - username: Bad username
+
+Cause: osTicket's installer has a hard-coded blocklist for the exact names
+`admin`, `admins`, `username` and `osticket`. This is not a database error,
+not a password error and not a container error. The installer runs inside the
+app container and exits with status 1. Docker then restarts the container
+because the restart policy is `unless-stopped`, so the same error repeats.
+
+Fix: use a different local admin username. I chose `homelab-admin`. The
+admin password stayed the same. The app recreated and completed the install.
+
+Problem 3: the first start left no schema, but that was expected after the
+validation failure. `SHOW TABLES` was empty and `ost_staff` did not exist. I
+did not remove the database volume. The next install ran against the same
+empty database and succeeded.
+
+Problem 4: one verification command ran outside the Compose directory. The
+command was `docker compose ps` in a shell that did not set the working
+directory. Compose returned:
+
+    no configuration file provided: not found
+    Exited with code 1
+
+The stack was not broken. Compose simply looked for `docker-compose.yml` in
+the home directory. I reran the same check from `~/ticket-system/compose` and
+it worked. The mistake was in the shell invocation, not in the stack.
+
+Known warnings that were not failures:
+
+- The app logs this on every start:
+
+      nginx: [alert] could not open error log file: open() "/var/lib/nginx/logs/error.log" failed (30: Read-only file system)
+
+  The root filesystem is read-only. The rendered nginx config logs to
+  `/dev/stderr`, so the real access log still appears in `docker compose logs`.
+  The alert comes from nginx trying to open its compiled-in default error log
+  before it reads the rendered config. The app is healthy and serves requests.
+
+- MariaDB logs:
+
+      [Warning] mariadbd: io_uring_queue_init() failed with EPERM
+      create_uring failed: falling back to libaio
+
+  The host has `kernel.io_uring_disabled=2`, so MariaDB falls back to
+  `libaio`. The database started and passed its healthcheck. This is a host
+  setting, not a stack setting, and I did not change it.
+
+- MariaDB also logs that `/sys/fs/cgroup///memory.pressure` is not writable.
+  The container still starts and the healthcheck passes. I left it alone.
+
+WHAT I ASSUMED WRONGLY
+
+1. I assumed `ADMIN_USER=admin` was a valid local username. The osTicket
+   installer rejects it on purpose. The validation is separate from the
+   normal username character check. I should have read the installer's
+   username rules before choosing the first admin account.
+
+2. I assumed that setting `character-set-server=utf8mb4` in `mariadb.cnf`
+   would make the osTicket database and tables use utf8mb4. It did not. The
+   osTicket installer runs:
+
+       ALTER DATABASE <name> DEFAULT CHARACTER SET utf8 COLLATE utf8_general_ci
+
+   and `install-mysql.sql` creates tables with `DEFAULT CHARSET=utf8`. On
+   MariaDB 11.8 those names resolve to utf8mb3. The server variables are
+   utf8mb4, but the database and tables are utf8mb3 with table collation
+   `utf8mb3_uca1400_ai_ci`. I did not convert the tables. A broad conversion
+   would change the upstream schema and could hit index or column limits. I
+   recorded it as a known limitation instead.
+
+3. I assumed a tmpfs mount would inherit the image directory ownership. It
+   does not. Docker creates it fresh with root ownership. The mount options
+   have to set `uid`, `gid` and `mode` explicitly.
+
+4. I assumed the `PORTS` column in `docker compose ps` would make it obvious
+   whether a port is published. It lists the image's exposed ports as
+   `8080/tcp` and `9000/tcp`, but those are not host bindings. The reliable
+   checks are `docker port <container>` and `.HostConfig.PortBindings`. Both
+   were empty or `{}`.
+
+5. I assumed the first `docker compose up -d` would be the end of the start.
+   It was not. The application's own installer validation failed after the
+   database was already healthy. The container healthcheck did its job and
+   made the loop visible instead of leaving a half-started web server.
+
+DEAD ENDS
+
+- Trying `Admin` instead of `admin` would not work. The installer lowercases
+  the name before the blocklist check. I confirmed this in the source and did
+  not spend a restart on it.
+
+- Patching `class.installer.php` inside the container, or replacing the
+  `setup_hidden` tree, would make the local deployment diverge from the
+  audited image digest. It would also be lost on every container recreate.
+  I rejected that path. The configuration value is the supported fix.
+
+- Making the root filesystem writable to get around the tmpfs error would
+  remove one of the main hardening controls. I rejected it. The mount options
+  fixed the actual problem without weakening the container.
+
+- Removing the database volume to force a clean install was not necessary.
+  The failed install had not created any tables. Removing the volume would
+  have destroyed the only copy of the database for no reason.
+
+- Converting every osTicket table to utf8mb4 was considered and not done.
+  The upstream installer explicitly chooses utf8, and the schema is part of
+  the audited release. I would need a tested migration and a backup before
+  changing it.
+
+HOW I DIAGNOSED IT
+
+The first signal was the health state, not the HTTP port. `docker compose ps`
+showed the database healthy and the app restarting. `docker compose logs
+osticket` showed the installer error. I did not guess from the container
+status alone.
+
+I then searched the image for the exact error string and read the installer
+around the hit. That showed the blocklist and explained why a normal username
+validator would accept `admin` while the installer would not. I also checked
+`strtolower` in the condition, which ruled out a case-only change.
+
+Before changing the environment, I checked the database state. `SHOW TABLES`
+returned nothing and `ost_staff` did not exist. That told me the failed run
+had not written a partial schema and that reusing the volume was safe.
+
+For the tmpfs problem, I ran the same image with the same read-only and tmpfs
+flags and asked it to create the directories directly. The permission error
+was immediate. I checked `id` and `ls -ld /run/osticket` inside the test
+container. The user was uid 1000 and the tmpfs was root:root 755. The mount
+options were the cause, not the entrypoint.
+
+For the charset mismatch, I used `SHOW CREATE DATABASE` and `SHOW CREATE
+TABLE ost_ticket`, then compared them with the installer source. The server
+variables and the schema were different on purpose. That changed the finding
+from "my config did not apply" to "the application explicitly overrides it".
+
+HOW I FIXED IT
+
+1. Added the tmpfs ownership options to `compose/docker-compose.yml`:
+
+       /run/osticket:rw,noexec,nosuid,size=64m,uid=1000,gid=0,mode=770
+       /tmp:rw,noexec,nosuid,size=64m,mode=1777
+
+2. Backed up `.env` and `.env.example`, changed `ADMIN_USER` to
+   `homelab-admin`, and added a comment about the osTicket blocklist.
+
+3. Ran `docker compose config --quiet`, then `docker compose up -d`. Compose
+   recreated the app container and left the database container and volume
+   alone.
+
+4. Did not patch the image, did not make the root filesystem writable, did
+   not remove the database volume, and did not convert the schema charset.
+
+HOW I VERIFIED IT
+
+Health and ports:
+
+    NAME                       STATUS                        PORTS
+    ticket-system-db-1         Up 4 minutes (healthy)        3306/tcp
+    ticket-system-osticket-1   Up About a minute (healthy)   8080/tcp, 9000/tcp
+
+Both healthchecks had exit code 0. `docker port ticket-system-osticket-1`
+and `docker port ticket-system-db-1` returned no output. The app inspect
+showed `PortBindings={}`. The database inspect also showed
+`PortBindings={}`. `ss -tln` showed no host listener on 8080 or 3306. The
+`8080/tcp` and `9000/tcp` values in `docker compose ps` are exposed container
+ports, not host bindings.
+
+The backend network inspect showed `internal=true` with both containers
+attached. The `homelab` network showed only the application container. The
+database had no address on `homelab`.
+
+Internal HTTP from another container on the `homelab` network:
+
+    status: 200 text/html; charset=utf-8 6506
+
+The response headers included:
+
+    Server: nginx
+    Content-Type: text/html; charset=utf-8
+    Content-Security-Policy: frame-ancestors 'self'; script-src 'self' 'unsafe-inline'; object-src 'none'
+    X-Content-Type-Options: nosniff
+    X-XSS-Protection: 1; mode=block
+    Set-Cookie: OSTSESSID=<redacted>; ...; HttpOnly; SameSite=Lax
+
+There was no `X-Powered-By` header. The session cookie was HttpOnly and
+SameSite=Lax. The login form had the fields `__CSRFToken__`, `do`, `userid`,
+`passwd` and `submit`.
+
+Agent login:
+
+    csrf-token-length=40
+    login-status=302
+    Location: index.php
+    index-status=200
+    dashboard-marker=found
+    login-error-text=absent
+
+The login test ran in a temporary container on `homelab` with the admin
+password file mounted read-only. The POST used
+`--data-urlencode "passwd@/run/secrets/admin_password"`, so the value stayed
+out of the shell command and the output. The test did not echo the password
+or the session cookie.
+
+Database:
+
+    72 tables
+    staff_id 1, username homelab-admin, email admin@home.arpa
+    helpdesk_url http://tickets.home.arpa
+    enable_auto_cron 0
+
+The database server variables were:
+
+    character_set_server     utf8mb4
+    collation_server         utf8mb4_unicode_ci
+    innodb_buffer_pool_size  134217728
+    local_infile             OFF
+    max_allowed_packet       67108864
+    skip_name_resolve        ON
+
+The database and table charset was the exception noted above:
+
+    CREATE DATABASE osticket ... DEFAULT CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci
+    ost_ticket ... DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_uca1400_ai_ci
+
+Container security:
+
+    User=1000:1000
+    ReadonlyRootfs=true
+    CapDrop=["ALL"]
+    Memory=943718400
+    NanoCpus=1000000000
+    PortBindings={}
+    Tmpfs={"/run/osticket":"rw,noexec,nosuid,size=64m,uid=1000,gid=0,mode=770","/tmp":"rw,noexec,nosuid,size=64m,mode=1777"}
+    SecurityOpt=["no-new-privileges=true"]
+    Networks=homelab=<dynamic> ticket-system_backend=<dynamic>
+    Health=healthy
+
+The database container had only `ticket-system_backend=<dynamic>` and no
+host port bindings. The exact container addresses are dynamic and were
+omitted from this log.
+
+Filesystem and PHP in the running app:
+
+    touch /write-probe
+    touch: /write-probe: Read-only file system
+
+    touch /run/osticket/write-probe
+    ok
+
+    -rw-r----- 1 osticket osticket 6458 /run/osticket/ost-config.php
+
+The secret files were mode 600. The FPM pool had `pm.max_children = 6`,
+`pm.start_servers = 2`, `pm.max_requests = 500` and `clear_env = yes`. The
+running PHP values included:
+
+    memory_limit => 160M
+    post_max_size => 25M
+    upload_max_filesize => 25M
+    expose_php => Off
+    display_errors => Off
+    allow_url_fopen => Off
+    pcre.jit => Off
+    session.cookie_httponly => On
+    session.use_strict_mode => On
+
+Restart check:
+
+    sudo -n docker compose restart osticket
+
+The app became healthy again. The log said:
+
+    [install-seed] already installed (found ost_config)
+    [install-seed] config refreshed, skipping schema/admin/SMTP seed.
+
+The staff count stayed 1 and the table count stayed 72. The tmpfs and
+`ost-config.php` were recreated on the restart, which is the expected
+behaviour of a read-only rootfs with a runtime tmpfs.
+
+Real client IP check:
+
+    curl -H "X-Real-IP: 203.0.113.10" http://osticket:8080/scp/login.php
+
+The access log showed the request from `203.0.113.10`, not from the testing
+container's own homelab address. The app trusts `172.20.0.0/16` and uses
+`X-Real-IP`, which matches what the existing nginx config sends.
+
+ROLLBACK
+
+Stop the stack without deleting data:
+
+    cd ~/ticket-system/compose
+    sudo -n docker compose stop
+
+Remove the containers and the internal network but keep the named volume:
+
+    cd ~/ticket-system/compose
+    sudo -n docker compose down
+
+The volume `ticket-system-db-data` stays after `down`. That is intentional.
+Do not run `docker compose down -v` and do not remove the volume without
+explicit approval, because it contains the tickets and the admin account.
+
+To undo only the application container after a bad environment change:
+
+    cd ~/ticket-system/compose
+    sudo -n docker compose up -d --force-recreate osticket
+
+To restore the pre-fix environment files for forensics:
+
+    cp .env.bak-2026-10-21-1241 .env
+    cp .env.example.bak-2026-10-21-1241 .env.example
+
+That restore puts `ADMIN_USER=admin` back and the installer will fail again.
+It is not a working rollback, only a way to get the old file back.
+
+The nginx config, DNS records and Samba AD were not changed in this step, so
+there is nothing to undo there. No host port was opened.
+
+LESSON LEARNED
+
+The installer's own validation is part of the application behaviour. A
+container can be healthy at the infrastructure level, connected to a healthy
+database, and still fail because the application rejects one form value.
+Read the installer rules before choosing the first admin account, especially
+when the value is a default like `admin`.
+
+A tmpfs is a new filesystem. It does not inherit the ownership of the
+directory it covers. When a container runs as a non-root user, the mount
+options need `uid`, `gid` and `mode` that let that user write.
+
+Server charset settings are not the same as application schema settings. I
+checked the actual `SHOW CREATE DATABASE` and `SHOW CREATE TABLE` output
+instead of trusting `character_set_server`.
+
+The healthcheck and the restart count were more useful than the container
+status alone. They showed a repeating application failure and gave me a
+reason to read the logs immediately.
+
+File-based secrets worked as intended. The logs only said that the entrypoint
+loaded each secret from its file. The values never appeared in the compose
+file, the environment, the logs or the repository.
+
+The database volume survived the app recreate. That is the right separation:
+application config can be recreated, data must not be. I did not use the
+volume as a debugging toy.
+
+A first start is not verified until the login works and a restart keeps the
+data. HTTP 200 on the login page alone would not have proved that the admin
+account was usable.
+
+NEXT
+
+The stack is healthy inside `homelab`, but `tickets.home.arpa` still has no
+DNS record and no nginx vhost. The next step is the DNS decision, then a
+backed-up nginx config edit and `nginx -t` inside the existing nginx
+container. LDAP against Samba AD comes after that. The image enforces
+external cron, so a cron worker or an explicit decision about it is still
+open.

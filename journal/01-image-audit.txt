@@ -1,0 +1,378 @@
+STEP 01 - Audit the osTicket image before the first deployment
+
+CONTEXT
+The project is osTicket on the homelab Arch server. The chosen image is
+hlhd/osticket:v1.18.4 because there is no official osTicket image and the
+older osticket/osticket image has not been updated since 2020. Before I put
+this image on the shared homelab network, I need to answer three questions:
+
+1. Is this really osTicket 1.18.4 and not a modified copy?
+2. Does the image contain known malware, secrets, unexpected users or
+   persistence hooks?
+3. Does it actually start, install the schema and serve the login page?
+
+The project rules say no new published host port, no `:latest`, no secrets in
+the repository, and no change to the existing homelab containers. This audit
+does not deploy anything. It only pulls the image, inspects it, scans it and
+runs a temporary test stack on an isolated Docker network.
+
+Host context at the start of this step:
+- Docker active, 7 homelab containers healthy.
+- Shared network homelab, 172.20.0.0/16.
+- Only homelab-nginx-nginx-1 publishes ports 80 and 443.
+- The image is going to be used on an internal Docker network with no
+  published port. The existing nginx container will be the only entry point.
+
+WHAT I TRIED
+1. Checked the local tooling. trivy, grype, syft, clamscan, cosign and the
+   Docker scout/buildx/trust plugins were not installed.
+2. Resolved the image tag and pulled it with Docker.
+3. Read the image metadata: digest, size, architecture, user, entrypoint,
+   command, exposed ports, healthcheck, labels and environment.
+4. Read the full image history and the Dockerfile at tag v1.18.4.
+5. Exported the image filesystem without starting the container, then scanned
+   the files.
+6. Downloaded the official osTicket 1.18.4 release zip and compared its
+   `upload/` tree with `/var/www/html` in the image.
+7. Scanned the Alpine packages with Trivy 0.76.0. The full rootfs scan hung,
+   so I scanned a minimal root that contained the apk database and os-release.
+8. Scanned the application tree with Trivy for Composer vulnerabilities and
+   secrets.
+9. Scanned the extracted filesystem with ClamAV 1.5.4 and the full signature
+   database. ClamAV skipped one large xz stream, so I extracted that stream and
+   scanned the decompressed source separately.
+10. Checked the official php.net source tarball against the xz file in the
+    image by SHA256.
+11. Checked for setuid and setgid files, world-writable files, SSH keys, shell
+    history, sudoers, cron jobs, LD_PRELOAD, unexpected users with uid 0 and
+    empty passwords.
+12. Checked the plugin tree for dangerous constructs and for direct use of
+    request data in exec, include or unserialize calls.
+13. Ran the image with a temporary MariaDB 11.8.9 container on an isolated
+    Docker network. The test used random throwaway passwords. No port was
+    published and no named volume was created.
+14. Removed the temporary containers and network after the test and checked
+    that the 7 homelab containers were still healthy.
+
+WHAT WENT WRONG
+- The first `docker pull` did not finish inside the 120 second command
+  timeout. The local image list was still empty afterwards, so the pull had
+  not completed and no partial image was registered. A second pull with a
+  600 second timeout completed.
+- `docker image inspect --format '... {{json .Config.Volumes}} ...'` failed
+  with:
+      template parsing error: template: :11:23: executing "" at
+      <.Config.Volumes>: map has no entry for key "Volumes"
+  The image simply has no `Volumes` key in its config. I stopped using the
+  Go template for that field and parsed the JSON with Python instead.
+- `docker export` wrote the tar as root with mode 0600. Extraction as the
+  normal user failed with:
+      tar: /var/tmp/osticket-rootfs.tar: Funkce open selhala: Operace zamítnuta
+      tar: Error is not recoverable: exiting now
+  The Czech message means "open failed: Operation not permitted". I changed
+  the tar mode to 0644 with `sudo chmod` and extracted it with
+  `tar --no-same-owner`.
+- The first ClamAV command used `--max-threads=1`. `clamscan` does not have
+  that option:
+      clamscan: unrecognized option `--max-threads=1'
+      ERROR: Unknown option passed
+      ERROR: Can't parse command line options
+  The option belongs to `clamdscan`, not `clamscan`. I removed it.
+- The full ClamAV scan reported:
+      LibClamAV Warning: cli_scanxz: decompress file size exceeds limits -
+      only scanning 105906176 bytes
+  A targeted rescan with higher limits then hit the scan time limit and
+  reported:
+      Heuristics.Limits.Exceeded.MaxScanTime FOUND
+  That is a scanner limit, not a virus. I extracted the xz file and scanned
+  the decompressed files.
+- A full Trivy rootfs scan did not finish. The first run was killed by the
+  900 second command timeout and the second by the 620 second timeout. There
+  was no output even with `--debug`. `--light` was accepted but printed
+  `"--light" is deprecated. This flag is ignored.` A scan of a small
+  directory worked immediately, so the binary and database were fine.
+- `nginx -t` inside a plain container failed:
+      nginx: [alert] could not open error log file: open()
+      "/var/lib/nginx/logs/error.log" failed (13: Permission denied)
+      [emerg] open() "/run/osticket/realip.conf" failed
+      (2: No such file or directory) in /etc/nginx/nginx.conf:29
+  The runtime files are generated by the entrypoint, so testing the image
+  before the entrypoint runs cannot succeed. Later, `nginx -t` without `-c`
+  tested the template `/etc/nginx/nginx.conf` and failed with:
+      host not found in "__HTTP_PORT__" of the "listen" directive in
+      /etc/nginx/nginx.conf:43
+  The running container uses the rendered `/run/osticket/nginx.conf`, not the
+  template. The correct test is `nginx -t -c /run/osticket/nginx.conf`.
+- The host has no `unzip` binary:
+      unzip: command not found
+  I used `python3 -m zipfile -e` to extract the official release zip.
+- The plugin `composer.phar` is not executable in the image (mode 0644), so
+  running it directly failed with "Operation not permitted". Running it as
+  `php composer.phar --version` worked and reported Composer 2.10.3.
+- `docker trust` and `docker buildx` are not installed:
+      docker: unknown command: docker trust
+      docker: unknown command: docker buildx
+  I could not check a Notary signature or an SBOM attestation.
+
+WHAT I ASSUMED WRONGLY
+- I assumed the image pull would fit in the default 120 second tool timeout.
+  It did not. Image pulls on this host need a longer timeout.
+- I assumed `.Config.Volumes` always exists in `docker image inspect`. It does
+  not, and a missing key aborts the whole template.
+- I assumed a Trivy rootfs scan of a 310 MB tree would be quick. It hung on
+  this image. Scanning the package database in a minimal root and the
+  application tree separately was enough for the evidence I needed.
+- I assumed the ClamAV xz warning meant an unscanned suspicious file. The file
+  is `/usr/src/php.tar.xz`, the PHP source tarball that comes with the
+  official PHP image. Its SHA256 matches the official php.net tarball.
+- I assumed `nginx -t` could validate the image's nginx configuration without
+  the entrypoint. The image stores a template, not the final config.
+- I assumed the Docker Hub tag was the artifact. Tags can move. The digest is
+  the artifact that must be pinned.
+- I assumed the plugin bundle was pinned to the osTicket 1.18.4 release. It is
+  not. The official plugin repository is cloned from the `develop` branch and
+  the community plugins are cloned from their default branches.
+
+DEAD ENDS
+- A full `trivy rootfs` scan of `/var/tmp/osticket-rootfs`. It timed out three
+  times with no useful output. I did not find the exact file or symlink that
+  makes Trivy hang. The workaround was a minimal root containing only
+  `lib/apk/db/installed` and `etc/os-release`, plus a separate `trivy fs` scan
+  of `/var/www/html`.
+- A targeted ClamAV scan of the xz file with `--max-filesize=500M` and
+  `--max-scansize=500M`. It hit the default two minute scan time and returned
+  `Heuristics.Limits.Exceeded.MaxScanTime FOUND`. That result is not malware.
+  Extracting the archive and scanning the files was faster and clearer.
+- Trying to run `composer.phar` directly. The file is not executable. The
+  version check had to go through `php`.
+- Trying to check image signatures with `docker trust` or `docker buildx`.
+  Neither plugin exists on this host. The image is therefore deployed by
+  digest, but I cannot prove a signature.
+- `nginx -t` without the rendered config. It validates the template and fails
+  on the `__HTTP_PORT__` placeholder. This is expected once the entrypoint is
+  understood, but it cost one diagnostic cycle.
+
+HOW I DIAGNOSED IT
+- Pull and metadata:
+      sudo -n docker pull hlhd/osticket:v1.18.4
+      sudo -n docker image inspect hlhd/osticket:v1.18.4
+      sudo -n docker history hlhd/osticket:v1.18.4 --no-trunc
+  The local digest is:
+      sha256:d115c1a73cafb790ca730e8805178c92484974ceab4f6109dd2a6c71b55e68f4
+- The image is amd64 Linux, created 2026-09-12T05:55:40Z, size 655,326,337
+  bytes. It runs as uid 1000, gid 1000. Entrypoint is
+  `tini -- docker-entrypoint.sh`, command is `web-run.sh`, workdir is
+  `/var/www/html`, and it exposes 8080 and 9000. The healthcheck calls
+  `curl -fsS http://127.0.0.1:${HTTP_PORT}/scp/login.php`.
+- The Dockerfile at tag v1.18.4 starts from `php:8.3.33-fpm-alpine`. It
+  installs nginx, tini, mariadb-client, tzdata, curl and su-exec, builds the
+  PHP extensions gd, gettext, imap, intl, ldap, mbstring, mysqli, opcache,
+  pdo_mysql and zip, downloads the osTicket release zip, renames `setup` to
+  `setup_hidden`, clones the official plugin repository from `develop`,
+  clones 11 community plugin repositories from their default branches,
+  removes the `.git` directories, and copies the rootfs helper scripts.
+- The build downloads the osTicket zip without a checksum and clones plugin
+  branches without commit pins. This is a supply-chain weakness of the build,
+  not proof of malicious content. It is the main reason the digest must be
+  pinned.
+- Integrity check against the official release:
+      curl -fsSL -o osTicket-v1.18.4.zip \
+        https://github.com/osTicket/osTicket/releases/download/v1.18.4/osTicket-v1.18.4.zip
+      sha256sum osTicket-v1.18.4.zip
+  Result:
+      a4187df5f52dd41625e6b61b322245853542e12b5969a45f0a6d81f7ab8151a7
+  I extracted the zip and compared `upload/` with the image:
+      diff -qr osticket-upstream/upload osticket-rootfs/var/www/html
+  The diff has 33 lines. The only core application file that differs is
+  `include/class.auth.php`. The other lines are the added plugin tree, the
+  `include/ost-config.php` symlink to `/run/osticket/ost-config.php`, and the
+  renamed `setup_hidden` directory. The `class.auth.php` diff is the
+  documented CrowdSec patch: it writes one JSON line to stderr on a failed
+  login, with the client IP and username, and never the password. I did not
+  find an unexpected change in the osTicket core.
+- The installed version marker is `define('THIS_VERSION', 'v1.18.4');` in
+  `bootstrap.php`.
+- Trivy OS packages (Alpine 3.24.1, 70 packages):
+      HIGH      1
+      MEDIUM   17
+      LOW      16
+      UNKNOWN   2
+  The HIGH is:
+      CVE-2026-103111  pcre2  10.48-r0 -> 10.49-r0
+      pcre2: out-of-bounds write via crafted regular expression
+  The medium findings include curl/libcurl, libpng, nghttp2-libs, zlib and
+  several MariaDB client/common replication issues. The image contains no
+  MariaDB server; the database is a separate container.
+  I checked the context of the pcre2 HIGH. The nginx config does not enable
+  `pcre_jit`, so the JIT path is not active there. PHP reports its own bundled
+  PCRE library version 10.42 with JIT on. The osTicket core uses fixed regex
+  patterns; I found six `preg_match` calls on six lines where a request value
+  is passed as the subject (four unique code locations, because phpCAS is
+  duplicated in the plugin library). All use a fixed pattern. I did not find a
+  user-controlled pattern. This lowers the practical risk, but it does not
+  remove the unpatched library.
+- Trivy application tree (`/var/www/html`):
+      LOW      CVE-2026-46644  symfony/polyfill-intl-idn  v1.29.0 -> 1.38.1
+      MEDIUM   CVE-2026-45802  setasign/fpdi              v2.6.4 -> 2.6.7
+      secrets  0
+  The FPDI issue is a memory exhaustion and endless loop in PDF handling.
+  The symfony issue is low severity. Both are application dependency issues,
+  not malware.
+- ClamAV 1.5.4 with 3,628,175 signatures scanned the extracted filesystem:
+      5,648 files, 599.44 MiB, 0 infected
+  The only warning was the xz decompression limit for
+  `/usr/src/php.tar.xz`. I scanned the decompressed PHP source separately:
+      23,417 files, 287.39 MiB, 0 infected
+  The decompressed scan printed four `index_local_file_headers_within_bounds`
+  errors on small PHP test fixtures. Those are ClamAV parsing errors, not
+  detections.
+  The xz file hash is:
+      e293ed620cec74651bb4a071317892a478aa6840fab22db45c72d77cd42f9676
+  The official php.net `php-8.3.33.tar.xz` has the same hash and `cmp` says
+  the files are identical. The skipped stream is the official PHP source,
+  not an unknown payload.
+- Filesystem hygiene:
+      setuid files: 0
+      setgid files: 0
+      world-writable files: 0
+      SSH keys or authorized_keys: 0
+      shell history files: 0
+      sudoers files: 0
+      /etc/ld.so.preload: absent
+      uid 0 accounts: root only
+      root password field: * (locked)
+      cron: only the stock Alpine /etc/crontabs/root entries that run
+            /etc/periodic
+      /etc/periodic scripts: none
+      package count: 70
+      git, system composer, compilers, ssh, nc, socat, wget: not installed
+      curl, mariadb-client, nginx, su-exec, tini: installed
+      composer.phar remains under the plugin tree
+  The root account is locked and the `osticket` account has uid 1000 and a
+  nologin shell. The image does not contain an SSH server.
+- Plugin review:
+      eval/base64_decode/shell_exec/proc_open hits: 56, mostly in the
+      vendored AWS SDK, PEAR Net_LDAP2 and the plugin build script make.php.
+      direct request data in exec, include, require or unserialize: 0
+  The `eval($cdata_class)` hits in the archiver plugin build a class name from
+  a dynamic form id, not from a request value. The `shell_exec` hit is the AWS
+  SDK credential_process feature. The `popen`/`proc_open` hits are in
+  `make.php`, a build tool that is under `/include` and is blocked by nginx.
+  This is not proof that every plugin is safe, but I did not find a webshell
+  pattern or an obvious request-to-command path.
+- The plugin lock file pins the Composer dependencies (AWS SDK 3.395.0,
+  Guzzle 7.15.5, phpCAS 1.3.3, league/oauth2-client 2.9.0 and others). The
+  plugin source directories themselves are not pinned. `composer.phar` is
+  Composer 2.10.3 and has a valid SHA-512 Phar signature.
+- Runtime smoke test:
+      temporary network: osticket-smoke
+      database: mariadb:11.8.9, tmpfs data directory, no named volume
+      application: hlhd/osticket:v1.18.4, no published port
+      database ready after 10s
+      application health: healthy
+      HTTP GET /scp/login.php: 200 OK, 6,519 bytes
+      page title: osTicket :: Agent Login
+      session cookie: HttpOnly
+      database schema: ost_config, ost_staff, ost_ticket and others created
+      admin row: smokeadmin
+      healthcheck exit code: 0
+  The test passwords were generated with `openssl rand` for this run and were
+  not written to the repository or to the log. The temporary containers and
+  network were removed afterwards. No named volume was created; the database
+  used a tmpfs directory. The 7 homelab containers were still healthy after
+  cleanup.
+- `nginx -t` against the rendered config:
+      nginx: the configuration file /run/osticket/nginx.conf syntax is ok
+      nginx: configuration file /run/osticket/nginx.conf test is successful
+  The alert about the default `/var/lib/nginx/logs/error.log` permission is
+  harmless because the running config logs to `/dev/stderr`.
+- Docker Hub reports 24,563 pulls for the repository. The GitHub repository
+  HomeLabHD/osticket has 3 stars, was created 2026-06-27 and was last pushed
+  2026-09-12. I could not check a Notary signature or an SBOM attestation
+  because `docker trust` and `docker buildx` are not installed. No signature
+  was verified in this step.
+
+HOW I FIXED IT
+- The pull was repeated with a 600 second timeout.
+- The image metadata was read as JSON and parsed with Python instead of a
+  fragile Go template.
+- The exported tar was made readable and extracted with
+  `tar --no-same-owner`.
+- The Trivy scan was split into an OS package scan against a minimal root and
+  an application scan with `trivy fs`.
+- The invalid ClamAV option was removed. The xz stream was extracted and
+  scanned, and its hash was compared with php.net.
+- The nginx test was run against the rendered `/run/osticket/nginx.conf`, not
+  the template.
+- The image was tested with a real MariaDB container and a real HTTP request,
+  then the test resources were removed.
+
+HOW I VERIFIED IT
+- The local image digest is
+  sha256:d115c1a73cafb790ca730e8805178c92484974ceab4f6109dd2a6c71b55e68f4.
+- The osTicket core matches the official 1.18.4 release except for the
+  documented CrowdSec patch, the runtime config symlink, the renamed setup
+  directory and the plugin tree.
+- ClamAV found 0 infected files in both the final filesystem and the
+  decompressed PHP source. The only skipped stream is byte-identical to the
+  official php.net source tarball.
+- Trivy found no application secrets. The OS and application findings are
+  listed above, with fixed versions where available.
+- The filesystem has no setuid/setgid files, no world-writable files, no
+  SSH keys, no shell history, no sudoers, no LD_PRELOAD and only one uid 0
+  account (root, locked).
+- The image starts, installs osTicket, creates the schema and admin, serves
+  the agent login page with HTTP 200, and passes its own healthcheck.
+- The existing homelab containers were healthy after the test.
+
+Verdict:
+- This is not a malware image. I found no infected files, no webshell
+  pattern, no unexpected persistence and no secret material. The core
+  application is the official 1.18.4 release with one documented patch.
+- It is not a perfectly clean image either. The main residual risks are:
+  1. Unpinned plugin sources (`develop` and default branches) and no checksum
+     on the osTicket zip during the image build. The current digest is fixed,
+     but a rebuild of the same tag is not reproducible.
+  2. One HIGH OS package CVE (pcre2) and 17 medium OS findings. Nginx does not
+     enable PCRE JIT here, and the PHP bundled PCRE2 10.42 is old and is not
+     covered by the apk scan. A hardening ini with `pcre.jit=0` is advisable.
+  3. Two application dependency findings (FPDI medium, symfony polyfill low).
+  4. No image signature or SBOM attestation that could be verified with the
+     tools on this host.
+- My recommendation is to proceed with hlhd/osticket:v1.18.4, pinned by
+  digest, with a small hardening ini and only the plugins needed for LDAP
+  enabled. If the project needs a fully reproducible build, the fallback is a
+  self-built image from the official zip with checksums and pinned plugin
+  commits. That is more work and still uses a PHP base with bundled PCRE2
+  10.42 unless the base is rebuilt.
+
+ROLLBACK
+No homelab service, nginx config, Samba setting or DNS record was changed.
+The temporary smoke containers and the osticket-smoke network were removed.
+No named volume was created; the database used a tmpfs directory.
+
+Local artifacts that can be removed later, only with approval:
+- image hlhd/osticket:v1.18.4
+- image mariadb:11.8.9 (pulled only for the smoke test)
+- image clamav/clamav:1.5.4-debian13-slim
+- /var/tmp/osticket-rootfs and /var/tmp/osticket-rootfs.tar
+- /var/tmp/osticket-upstream and /var/tmp/osticket-diff.txt
+- /var/tmp/php-src and /var/tmp/php-8.3.33.tar.xz
+- /var/tmp/clamdb, /var/tmp/trivy-cache, /var/tmp/tools, /var/tmp/miniroot
+- /var/tmp/osticket-inspect.json, /var/tmp/osticket-history.txt,
+  /var/tmp/osticket-Dockerfile.txt, /var/tmp/trivy-os.json,
+  /var/tmp/trivy-app.json, /var/tmp/clam-php.log,
+  /var/tmp/plugin-danger.txt, /var/tmp/osticket-smoke.log,
+  /var/tmp/osticket-smoke.sh
+
+The repository files added in this step can be reverted by restoring the
+backup CHANGELOG.txt.bak-2026-10-20-2018 or by editing the journal entry. The
+repository has no commit yet, so a Git revert is not available.
+
+LESSON LEARNED
+A clean antivirus scan is not the same as a clean image. The useful evidence
+was the combination of the official release diff, the package scan, the
+secret scan, the filesystem hygiene check and a real startup test. The image
+is usable, but the tag is not the artifact; the digest is. Pin the digest,
+write down the residual CVEs and do not enable plugins that the project does
+not need.

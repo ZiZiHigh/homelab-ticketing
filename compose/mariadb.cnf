@@ -1,0 +1,9 @@
+[mysqld]
+bind-address = 0.0.0.0
+skip-name-resolve
+character-set-server = utf8mb4
+collation-server = utf8mb4_unicode_ci
+innodb_buffer_pool_size = 128M
+max_connections = 50
+max_allowed_packet = 64M
+local_infile = 0

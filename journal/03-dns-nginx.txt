@@ -1,0 +1,593 @@
+STEP 03 - Publish osTicket at tickets.home.arpa through nginx and Samba DNS
+
+CONTEXT
+The Compose stack was healthy and verified. osTicket was reachable only as
+`osticket:8080` from the Docker network `homelab`. The application did not
+publish a host port. The next job was to put it behind the existing nginx
+container and make the name `tickets.home.arpa` resolve for the main PC.
+
+The host is the homelab Arch server. Its LAN address is `192.168.88.32/24`
+on `wlan0`. The main PC is NixOS at `192.168.88.247`. The router is
+`192.168.88.1`. The Samba AD forest is `ad.home.arpa` and the DC is
+`dc1.ad.home.arpa`, also at `192.168.88.32`.
+
+The nginx proxy is the existing container `homelab-nginx-nginx-1`. It is the
+only service that publishes host ports. It listens on `0.0.0.0:80` and
+`0.0.0.0:443`. The live config is `~/homelab/nginx/nginx.conf`. The
+osTicket container is on the shared network as `osticket:8080`.
+
+The Samba DNS server had only these zones before the change:
+
+    ad.home.arpa
+    88.168.192.in-addr.arpa
+    _msdcs.ad.home.arpa
+
+There was no `home.arpa` zone. That was the main problem in this step. A
+record cannot be added to a zone that the server does not host.
+
+Scope for this step: HTTP only, no HTTPS, no email, no new host port. The
+application stays on the existing nginx container. The app and database
+configuration were not changed.
+
+WHAT I TRIED
+
+1. Read the live nginx configuration and checked the listeners.
+
+   The port 80 default server redirected every unknown name to HTTPS:
+
+       server {
+           listen 80 default_server;
+           server_name _;
+
+           location = /healthz {
+               access_log off;
+               return 200 "ok\n";
+           }
+
+           location / {
+               return 301 https://$host$request_uri;
+           }
+       }
+
+   The existing service vhosts were all on `listen 443 ssl`, for example
+   `jellyfin.home`, `search.home` and `grafana.home`. A new HTTP-only name
+   therefore needed its own `server_name` block on port 80. Relying on the
+   default vhost would have sent the main PC to HTTPS, which is out of scope
+   and would have produced a certificate warning.
+
+   `ss -tln` showed only these host listeners:
+
+       LISTEN 0 4096 0.0.0.0:443 0.0.0.0:*
+       LISTEN 0 4096 0.0.0.0:80  0.0.0.0:*
+       LISTEN 0 4096 [::]:443    [::]:*
+       LISTEN 0 4096 [::]:80     [::]:*
+
+   No listener existed on 8080 or 3306. That matched the earlier Compose
+   verification.
+
+2. Backed up the live nginx config before editing it:
+
+       cd ~/homelab/nginx
+       cp -a nginx.conf nginx.conf.bak-2026-10-21-1259
+       stat -c '%a %s %n' nginx.conf nginx.conf.bak-2026-10-21-1259
+
+   Output:
+
+       644 6578 nginx.conf
+       644 6578 nginx.conf.bak-2026-10-21-1259
+
+3. Added a dedicated HTTP-only vhost inside the `http {}` block. The live
+   block is copied to `nginx/tickets.home.arpa.conf` in this repository.
+
+       server {
+           listen 80;
+           server_name tickets.home.arpa;
+
+           add_header Referrer-Policy no-referrer always;
+           add_header X-Robots-Tag "noindex, nofollow" always;
+
+           client_max_body_size 25m;
+
+           location / {
+               allow 127.0.0.1;
+               allow 172.16.0.0/12;
+               allow 192.168.88.0/24;
+               deny all;
+
+               set $osticket_upstream http://osticket:8080;
+               proxy_pass $osticket_upstream;
+               proxy_http_version 1.1;
+               proxy_set_header Host $host;
+               proxy_set_header X-Real-IP $remote_addr;
+               proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+               proxy_set_header X-Forwarded-Proto $scheme;
+               proxy_set_header X-Forwarded-Host $host;
+               proxy_set_header X-Forwarded-Port $server_port;
+               proxy_connect_timeout 5s;
+               proxy_read_timeout 120s;
+               proxy_send_timeout 120s;
+           }
+       }
+
+   The upstream uses a variable and the global Docker resolver
+   `127.0.0.11 valid=10s ipv6=off`. That means nginx resolves `osticket`
+   through Docker DNS and does not keep the old container IP for the whole
+   nginx process lifetime. The 25m body limit matches the PHP settings for
+   osTicket. The allow list keeps the internal ticket system on the LAN and
+   the Docker networks.
+
+4. Validated and reloaded nginx:
+
+       sudo -n docker exec homelab-nginx-nginx-1 nginx -t
+       sudo -n docker exec homelab-nginx-nginx-1 nginx -s reload
+
+   Output:
+
+       nginx: the configuration file /etc/nginx/nginx.conf syntax is ok
+       nginx: configuration file /etc/nginx/nginx.conf test is successful
+       2026/10/21 11:00:14 [notice] 733#733: signal process started
+
+   The container stayed healthy:
+
+       homelab-nginx-nginx-1 Up 57 minutes (healthy) 0.0.0.0:80->80/tcp, [::]:80->80/tcp, 0.0.0.0:443->443/tcp, [::]:443->443/tcp
+
+5. Tested nginx before touching DNS. I used `curl --resolve` so the test did
+   not depend on the missing DNS record:
+
+       curl --resolve tickets.home.arpa:80:192.168.88.32 \
+         -sS -o /dev/null \
+         -w 'status=%{http_code} type=%{content_type} size=%{size_download}\n' \
+         http://tickets.home.arpa/scp/login.php
+
+   Output:
+
+       status=200 type=text/html; charset=utf-8 size=6506
+
+   The response headers were:
+
+       HTTP/1.1 200 OK
+       Server: nginx
+       Content-Type: text/html; charset=utf-8
+       Set-Cookie: OSTSESSID=<redacted>; ...; path=/; domain=tickets.home.arpa; HttpOnly; SameSite=Lax
+       Content-Security-Policy: frame-ancestors 'self'; script-src 'self' 'unsafe-inline'; object-src 'none'
+       X-Content-Type-Options: nosniff
+       X-XSS-Protection: 1; mode=block
+       Referrer-Policy: no-referrer
+       X-Robots-Tag: noindex, nofollow
+
+   There was no `X-Powered-By`. The cookie domain was correct for the new
+   hostname, and the cookie was still HttpOnly and SameSite=Lax.
+
+6. Tested the agent login through nginx with a temporary cookie jar. The
+   password was read from `compose/secrets/admin_password.txt` with
+   `--data-urlencode "passwd@..."`, so the value stayed out of the command
+   and the output:
+
+       csrf-token-length=40
+       login-status=302
+       Location: index.php
+       index-status=200
+       dashboard-marker=found
+
+7. Checked Samba DNS. The first command without credentials failed:
+
+       sudo -n samba-tool dns zonelist 127.0.0.1
+
+   Exact error:
+
+       Password for [AD\root]:Password for [AD\root]:Failed to bind to uuid 50abc2a4-574d-40b3-9d66-ee4fd5fba076 for ncacn_ip_tcp:127.0.0.1[49153,sign,abstract_syntax=50abc2a4-574d-40b3-9d66-ee4fd5fba076/0x00000005,localaddress=127.0.0.1] NT_STATUS_LOGON_FAILURE
+       ERROR: Connecting to DNS RPC server 127.0.0.1 failed with (3221225581, 'The attempted logon is invalid. This is either due to a bad username or authentication information.')
+
+   I did not have the AD Administrator password in the shell and I did not
+   put one on the command line. The local machine account was enough for the
+   DNS RPC calls in this setup:
+
+       sudo -n samba-tool dns zonelist 127.0.0.1 -P
+
+   Output:
+
+         3 zone(s) found
+
+         pszZoneName                 : ad.home.arpa
+         Flags                       : DNS_RPC_ZONE_DSINTEGRATED DNS_RPC_ZONE_UPDATE_SECURE
+         ZoneType                    : DNS_ZONE_TYPE_PRIMARY
+         ...
+         pszZoneName                 : 88.168.192.in-addr.arpa
+         ...
+         pszZoneName                 : _msdcs.ad.home.arpa
+         ...
+
+   There was no `home.arpa` zone.
+
+8. Confirmed that the name was being resolved by recursion, not by a local
+   zone:
+
+       dig +noall +answer +comments @127.0.0.1 home.arpa SOA
+       dig +noall +answer +comments @127.0.0.1 tickets.home.arpa A
+       dig +noall +answer +comments @192.168.88.1 tickets.home.arpa A
+
+   The `home.arpa` answer came from the IANA special-use zone:
+
+       home.arpa. 604800 IN SOA prisoner.iana.org. hostmaster.root-servers.org. 1 604800 60 604800 604800
+
+   The Samba answer for `tickets.home.arpa` had status NOERROR with no answer
+   and one authority record. The router at `192.168.88.1` returned NXDOMAIN.
+   Neither resolver had an authoritative local answer.
+
+9. Created the missing parent zone in Samba DNS:
+
+       sudo -n samba-tool dns zonecreate 127.0.0.1 home.arpa -P
+
+   Output:
+
+       Zone home.arpa created successfully
+
+10. Added the A record:
+
+       sudo -n samba-tool dns add 127.0.0.1 home.arpa tickets A 192.168.88.32 -P
+
+   Output:
+
+       Record added successfully
+
+11. Checked the zone. Samba created the NS target as `ad.home.arpa.`, while
+    the SOA was presented as `dc1.ad.home.arpa.` by `dig`. I wanted the NS
+    and SOA to point at the DC name. The first update attempt put `-P` after
+    the positional arguments and printed the command usage with rc=255. An
+    attempt with an empty apex returned:
+
+       ERROR: Record or zone does not exist.
+
+    The working form put `-P` before the positional arguments:
+
+       sudo -n samba-tool dns update -P 127.0.0.1 home.arpa @ NS \
+         "ad.home.arpa." "dc1.ad.home.arpa."
+
+   Output:
+
+       Record updated successfully
+
+    I then updated the SOA primary name and serial in the same way:
+
+       sudo -n samba-tool dns update -P 127.0.0.1 home.arpa @ SOA \
+         "ad.home.arpa. hostmaster.ad.home.arpa. 2 900 600 86400 3600" \
+         "dc1.ad.home.arpa. hostmaster.ad.home.arpa. 3 900 600 86400 3600"
+
+   Output:
+
+       Record updated successfully
+
+    Final zone contents:
+
+         Name=, Records=2, Children=0
+           SOA: serial=3, refresh=900, retry=600, expire=86400, minttl=3600, ns=dc1.ad.home.arpa., email=hostmaster.ad.home.arpa.
+           NS: dc1.ad.home.arpa.
+         Name=tickets, Records=1, Children=0
+           A: 192.168.88.32
+
+12. Verified DNS and HTTP without `--resolve`:
+
+        dig +noall +answer @127.0.0.1 home.arpa SOA
+        dig +noall +answer @127.0.0.1 home.arpa NS
+        dig +short @127.0.0.1 tickets.home.arpa A
+        dig +short @192.168.88.32 tickets.home.arpa A
+        getent hosts tickets.home.arpa
+        dig +short @127.0.0.1 ad.home.arpa SOA
+        dig +short @127.0.0.1 dc1.ad.home.arpa A
+
+    Output:
+
+        home.arpa. 3600 IN SOA dc1.ad.home.arpa. hostmaster.ad.home.arpa. 3 900 600 86400 3600
+        home.arpa. 3600 IN NS  dc1.ad.home.arpa.
+        192.168.88.32
+        192.168.88.32
+        192.168.88.32   tickets.home.arpa
+        dc1.ad.home.arpa. hostmaster.ad.home.arpa. 2 900 600 86400 3600
+        192.168.88.32
+
+    The AD zone still resolved. The Docker bridge addresses also appear in
+    the `dc1` A record because Samba registers every interface. That was
+    already true before this step and was not changed.
+
+13. Ran the login test again through the DNS name, with no `--resolve`:
+
+        csrf-token-length=40
+        login-status=302 remote=192.168.88.32
+        Location: index.php
+        index-status=200
+        dashboard-marker=found
+
+    The app access log showed the real client address:
+
+        192.168.88.32 - - [...] "GET /scp/login.php HTTP/1.1" 200 6519
+        192.168.88.32 - - [...] "POST /scp/login.php HTTP/1.1" 302 23
+        192.168.88.32 - - [...] "GET /scp/index.php HTTP/1.1" 200 23041
+
+WHAT WENT WRONG
+
+Problem 1: the default nginx port 80 vhost redirected to HTTPS.
+
+The first design idea was to rely on the existing port 80 server. That server
+ends with `return 301 https://$host$request_uri;`. It would have sent the
+main PC to the self-signed HTTPS vhost, which is not part of this project.
+The fix was a specific `server_name tickets.home.arpa` block on port 80 with
+no redirect.
+
+Problem 2: Samba DNS did not have a `home.arpa` zone.
+
+The DNS server was authoritative for `ad.home.arpa`, the reverse zone and
+`_msdcs.ad.home.arpa`. It was not authoritative for the parent `home.arpa`.
+Queries for `home.arpa` were resolved by recursion to the IANA special-use
+SOA. A record for `tickets.home.arpa` could not be added until the parent
+zone existed. I created the zone and then added the record.
+
+Problem 3: `samba-tool dns` without credentials failed.
+
+The command prompted for `AD\root` and then failed with
+`NT_STATUS_LOGON_FAILURE`. I did not have the AD Administrator password in
+the session. The local machine account worked with `-P` for reading the
+zones, creating the zone and adding the record. No password was typed or
+stored in a command line.
+
+Problem 4: the DNS update argument order was not obvious.
+
+The form
+
+    samba-tool dns update 127.0.0.1 home.arpa @ NS "ad.home.arpa." "dc1.ad.home.arpa." -P
+
+printed the usage and returned 255. Putting `-P` before the positional
+arguments worked. The empty-apex attempt also failed with
+`ERROR: Record or zone does not exist.` This was a command syntax problem,
+not a DNS or Samba failure.
+
+Problem 5: the router does not know the new name.
+
+The router at `192.168.88.1` returned NXDOMAIN for
+`tickets.home.arpa`. The server now resolves it through Samba DNS, but the
+main PC will only see it if its resolver points to `192.168.88.32` or it has
+a local hosts entry. The main PC side could not be tested from the server.
+
+Known warning that was not a failure:
+
+- The nginx container still logs its compiled-in error log alert on the
+  read-only rootfs. The rendered config logs to stderr, the access log works
+  and the container is healthy. This was already present before this step.
+
+WHAT I ASSUMED WRONGLY
+
+1. I assumed Samba DNS already hosted `home.arpa` because the AD domain is
+   `ad.home.arpa`. It hosted only the child zone `ad.home.arpa`. The parent
+   zone had to be created explicitly.
+
+2. I assumed that if the server could resolve `tickets.home.arpa`, the main
+   PC would resolve it too. DNS is client-specific. The main PC still needs
+   to use the Samba DNS server or a hosts entry.
+
+3. I assumed the existing port 80 default vhost could serve the new name.
+   It redirects every unknown host to HTTPS. The new name needed a specific
+   port 80 server block.
+
+4. I assumed `samba-tool dns update` would accept `-P` in the same position
+   as `samba-tool dns add`. The argument parser did not. The option had to
+   come before the positional arguments.
+
+5. I assumed the new zone's NS and SOA would be created with the DC name.
+   Samba used `ad.home.arpa.` for the NS and the SOA was displayed as
+   `dc1.ad.home.arpa.`. I updated both records so the zone is internally
+   consistent. The old records are still recoverable from the zone query
+   output in this journal.
+
+DEAD ENDS
+
+- Adding a `tickets` record directly to `home.arpa` before creating the zone
+  would fail because the zone did not exist. I checked the zone list first.
+
+- Adding the record to `ad.home.arpa` would have produced
+  `tickets.home.ad.home.arpa`, not `tickets.home.arpa`. A DNS record name is
+  relative to its zone. I did not use that path.
+
+- Relying on the router at `192.168.88.1` was a dead end. It returned
+  NXDOMAIN. The main PC must use Samba DNS or a hosts entry.
+
+- Relying on the default port 80 redirect was a dead end. It would have sent
+  the browser to HTTPS, and the project explicitly does not use HTTPS.
+
+- The `samba-tool dns update` command with `-P` at the end and the empty
+  apex attempt both failed. The working form was `-P` first and `@` for the
+  zone apex.
+
+- The existing `dc1.ad.home.arpa` A record contains Docker bridge addresses
+  in addition to `192.168.88.32`. Cleaning that up would mean changing the
+  AD DNS records for the DC. I did not do that. It was pre-existing and does
+  not stop direct queries to the Samba DNS server.
+
+HOW I DIAGNOSED IT
+
+I separated the proxy problem from the DNS problem.
+
+First, I read the nginx config and saw the port 80 default redirect. That
+explained why a browser using the default vhost would leave HTTP. I added a
+specific vhost and tested it with `curl --resolve`, which made nginx answer
+for `tickets.home.arpa` without needing DNS. The 200 response and the correct
+cookie domain proved the proxy path.
+
+Then I checked DNS independently. `samba-tool dns zonelist -P` listed the
+zones and showed there was no `home.arpa`. `dig` with the `+comments` flag
+showed that `home.arpa` was answered with recursion (`ra`) and the IANA SOA,
+not with the `aa` authoritative flag. That confirmed the missing zone. The
+router query returned NXDOMAIN. The diagnosis was not "nginx is broken"; it
+was "the name has no authoritative local zone".
+
+After creating the zone and record, I queried both `127.0.0.1` and
+`192.168.88.32`. The LAN address is the one the main PC will use. I also
+queried the existing `ad.home.arpa` zone to make sure the new parent zone did
+not break the AD namespace.
+
+Finally, I ran the login test without `--resolve`. A 200 on the login page
+only proves DNS and TCP. The 302 to `index.php` and the dashboard marker
+prove the cookie, the proxy headers, PHP sessions and the application path.
+
+HOW I FIXED IT
+
+1. Added the HTTP-only nginx vhost for `tickets.home.arpa`, with a 25m body
+   limit, real client IP headers, a Docker resolver upstream and a LAN allow
+   list.
+
+2. Backed up the nginx config to `nginx.conf.bak-2026-10-21-1259`. Ran
+   `nginx -t`, then `nginx -s reload`.
+
+3. Created the Samba DNS zone `home.arpa` with
+   `samba-tool dns zonecreate 127.0.0.1 home.arpa -P`.
+
+4. Added `tickets` A `192.168.88.32` with
+   `samba-tool dns add 127.0.0.1 home.arpa tickets A 192.168.88.32 -P`.
+
+5. Updated the new zone's NS and SOA names to `dc1.ad.home.arpa` so the
+   zone is consistent. The original `ad.home.arpa` zone was not changed.
+
+6. Did not add a host port, did not change the Compose stack, did not change
+   the application database, and did not configure HTTPS.
+
+HOW I VERIFIED IT
+
+Nginx configuration:
+
+    nginx: the configuration file /etc/nginx/nginx.conf syntax is ok
+    nginx: configuration file /etc/nginx/nginx.conf test is successful
+
+Nginx container:
+
+    homelab-nginx-nginx-1 Up 57 minutes (healthy) 0.0.0.0:80->80/tcp, [::]:80->80/tcp, 0.0.0.0:443->443/tcp, [::]:443->443/tcp
+
+No new host port:
+
+    docker port ticket-system-osticket-1
+    docker port ticket-system-db-1
+
+Both commands returned no output. `ss -tln` showed only 80 and 443, not 8080
+or 3306.
+
+HTTP through the proxy without a DNS override:
+
+    status=200 remote=192.168.88.32 size=6506
+
+The response had no `X-Powered-By`, had `Referrer-Policy: no-referrer`, had
+`X-Robots-Tag: noindex, nofollow`, kept the application CSP and nosniff
+headers, and set `OSTSESSID` with `domain=tickets.home.arpa; HttpOnly;
+SameSite=Lax`.
+
+DNS:
+
+    home.arpa. 3600 IN SOA dc1.ad.home.arpa. hostmaster.ad.home.arpa. 3 900 600 86400 3600
+    home.arpa. 3600 IN NS  dc1.ad.home.arpa.
+    tickets.home.arpa. 900 IN A 192.168.88.32
+
+The same answer came from `127.0.0.1` and from the LAN address
+`192.168.88.32`. `getent hosts tickets.home.arpa` returned
+`192.168.88.32 tickets.home.arpa`. The existing `ad.home.arpa` SOA and
+`dc1.ad.home.arpa` A record still resolved.
+
+Agent login through the DNS name:
+
+    csrf-token-length=40
+    login-status=302 remote=192.168.88.32
+    Location: index.php
+    index-status=200
+    dashboard-marker=found
+
+The app log showed the real client address `192.168.88.32` on the GET, POST
+and dashboard requests. No password or session cookie was printed.
+
+Client side, verified by the user on the main PC:
+
+The main PC is NixOS at `192.168.88.247`. No extra package is needed for the
+web interface; a browser is enough. The user confirmed that the page and the
+agent login work from that machine. The router returns NXDOMAIN for this name,
+but the main PC was not pointed at Samba for all DNS. Replacing the main PC
+resolver with only `192.168.88.32` would have moved internet and VPN name
+resolution to the DC.
+
+The chosen client change is one hosts entry:
+
+    networking.extraHosts = "192.168.88.32 tickets.home.arpa";
+
+The Samba A record remains for clients that already use the DC as their
+resolver. The main PC keeps its normal resolver and only overrides this one
+name.
+
+Test from the main PC:
+
+    getent hosts tickets.home.arpa
+    curl -I http://tickets.home.arpa/scp/login.php
+
+Use `getent hosts` instead of `resolvectl query`; the hosts entry is not a DNS
+answer and `resolvectl query` may not show it.
+
+The URL is `http://tickets.home.arpa`. It is not HTTPS. If the browser tries
+HTTPS first, type the full `http://` URL. Optional test tools are `curl` and
+`dig`; on NixOS they can be run from `nix-shell -p curl bind.dig`. The web UI
+itself does not need them.
+
+The agent login is `http://tickets.home.arpa/scp/login.php`, reached from the
+"I'm an agent - sign in here" link. The top-right "Sign In" link goes to
+`/login.php`, the client portal, and rejects staff credentials. The username is
+`homelab-admin`. The password is in `compose/secrets/admin_password.txt` and
+must not be printed into a terminal log, a ticket or the repository.
+
+ROLLBACK
+
+Nginx:
+
+    cd ~/homelab/nginx
+    cp -a nginx.conf.bak-2026-10-21-1259 nginx.conf
+    sudo -n docker exec homelab-nginx-nginx-1 nginx -t
+    sudo -n docker exec homelab-nginx-nginx-1 nginx -s reload
+
+DNS record and zone:
+
+    sudo -n samba-tool dns delete -P 127.0.0.1 home.arpa tickets A 192.168.88.32
+    sudo -n samba-tool dns zonedelete -P 127.0.0.1 home.arpa
+
+Deleting the zone removes the whole new `home.arpa` parent zone. The existing
+`ad.home.arpa` zone, the reverse zone and the `_msdcs` zone are separate and
+are not touched by that command. If more records are added to `home.arpa`
+later, export the zone first or delete only the records that belong to this
+project. After a rollback, remove the hosts entry on the main PC. If the main
+PC was also pointed at Samba DNS, restore its previous resolver settings and
+flush the DNS cache.
+
+The Compose stack does not need a rollback for this step. Its containers,
+networks and volume were not changed. No host port was opened.
+
+LESSON LEARNED
+
+A DNS name is not just a record. The server has to host a zone that is
+authoritative for that name. `ad.home.arpa` being present did not mean that
+`home.arpa` was present. The zone list is the first thing to check before
+adding a record.
+
+`curl --resolve` is a useful way to test a proxy before DNS exists. It let me
+prove the nginx block, the upstream, the cookie domain and the application
+login while the name was still NXDOMAIN. The later test without `--resolve`
+then proved the DNS part separately.
+
+The client resolver is part of the system. A successful request from the
+server does not prove that the main PC will work. The router returned NXDOMAIN
+for the new name. A single hosts entry was enough for the main PC, and it kept
+internet and VPN DNS working. Changing the global resolver to only the Samba DC
+would have been a larger, riskier change. This needs a check on the main PC,
+not just on the server.
+
+The default HTTP vhost was a trap. A specific `server_name` block is required
+when the default block redirects to HTTPS and the new service must stay on
+HTTP.
+
+Creating a parent zone makes Samba authoritative for that whole namespace.
+`ad.home.arpa` still resolves because it is a separate child zone, but future
+names under `home.arpa` will now be answered by the new zone. That is the
+intended behavior for this homelab, but it has to be written down.
+
+The Samba machine account could create the zone and update records with
+`-P`. I did not need the AD Administrator password. That is convenient for
+this local setup, but it also means the DC machine account has broad DNS
+rights. I did not change those permissions.

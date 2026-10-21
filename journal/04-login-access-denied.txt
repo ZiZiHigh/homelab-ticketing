@@ -1,0 +1,270 @@
+STEP 04 - Diagnose Access denied on the agent login
+
+NOTE (2026-10-21, corrected after user confirmation): The cause was the wrong
+sign-in form, not a bad password. The top-right "Sign In" link on the client
+portal goes to `/login.php`, which is the end-user login. Staff use
+`/scp/login.php`, reached from "I'm an agent - sign in here". The password was
+rotated in STEP 05 during the investigation, but the rotation was not the fix.
+The current 20-character password is in `compose/secrets/admin_password.txt`;
+the old 32-character password is no longer valid.
+
+CONTEXT
+The main PC could open `http://tickets.home.arpa` after adding a hosts entry
+for `192.168.88.32`. The page loaded, but the user got `Access denied` with the
+username `homelab-admin` and the password from
+`compose/secrets/admin_password.txt`.
+
+The server-side login had worked earlier from the host. The Compose stack was
+healthy. The new problem was therefore in authentication, not in DNS, nginx,
+the database connection or the application startup.
+
+The secret file is mode 600 and is not in Git. The password value is not
+printed in this journal. Only the shape of the file and the login results are
+recorded.
+
+WHAT I TRIED
+
+1. Confirmed that the login page was really served through the new name. The
+   main PC had already run:
+
+       curl -v --resolve tickets.home.arpa:80:192.168.88.32 \
+         http://tickets.home.arpa/scp/login.php
+
+   It returned HTTP 200 and the HTML title `osTicket :: Agent Login`. The
+   nginx vhost, the upstream and the application were working.
+
+2. Checked the local admin row without reading the password hash:
+
+       sudo -n docker compose exec -T db sh -c \
+         'MYSQL_PWD="$(cat /run/secrets/db_root_password)" mariadb -uroot -N -B \
+          -e "SELECT staff_id, username, isactive, isadmin, change_passwd, lastlogin, created FROM osticket.ost_staff;"'
+
+   The row was:
+
+       1  homelab-admin  1  1  0  2026-10-21 13:10:07  2026-10-21 12:41:58
+
+   The account was active, was an admin, and did not require a password
+   change. The `lastlogin` value was still from my earlier successful test at
+   13:10:07. The user's failed attempts had not updated it.
+
+3. Checked the secret file without printing its value:
+
+       cd ~/ticket-system/compose
+       p=$(cat secrets/admin_password.txt)
+       printf 'bytes=%s chars=%s\n' "$(wc -c < secrets/admin_password.txt)" "${#p}"
+       case "$p" in
+         ' '*|*' ') echo edge-whitespace=yes ;;
+         *) echo edge-whitespace=no ;;
+       esac
+
+   Output:
+
+       bytes=32 chars=32
+       edge-whitespace=no
+
+   The file had no trailing newline and no leading or trailing whitespace.
+
+4. Reproduced the browser request with the same AJAX parameter that the agent
+   login form uses. Each attempt used a fresh login page and a fresh CSRF
+   token. The password was read from a file with
+   `--data-urlencode "passwd@..."`, so the value was not printed. The matrix
+   was:
+
+       exact secret:              http=200  "status":302
+       wrong password:            http=200  "status":401
+                                  "message":"Access denied"
+       exact secret + space:      http=200  "status":401
+                                  "message":"Access denied"
+       exact secret + newline:    http=200  "status":401
+                                  "message":"Access denied"
+       username + trailing space: http=200  "status":302
+
+   The HTTP status is 200 for an AJAX login response. The application status
+   is inside the JSON. `302` means the login succeeded. `401` with the message
+   `Access denied` means the credentials were rejected.
+
+5. Checked `lastlogin` after the exact login:
+
+       1  homelab-admin  1  1  2026-10-21 13:51:41
+
+   The exact secret updated the timestamp. The failed variants did not.
+
+6. Checked the application syslog for failed login records:
+
+       SELECT log_id, log_type, title, created, LEFT(log, 160)
+       FROM osticket.ost_syslog
+       ORDER BY log_id DESC LIMIT 15;
+
+   The only row was the installation message:
+
+       1  Debug  osTicket installed!  2026-10-21 12:41:58  ...
+
+   Failed logins were not written to this table in this setup, so it was not
+   useful for identifying the attempted username or the submitted value.
+
+7. Inspected the actual links in the pages the user was using:
+
+       curl -sS http://tickets.home.arpa/ | grep -i 'Sign In'
+       curl -sS http://tickets.home.arpa/login.php | grep -i -A2 -B2 "I'm an agent"
+
+   The relevant HTML was:
+
+       GET /            -> <a href="/login.php">Sign In</a>
+       GET /login.php   -> I'm an agent ... <a href="/scp/">sign in here</a>
+
+   The top-right "Sign In" is the client portal. The agent login is
+   `/scp/login.php` or `/scp/` after clicking the agent link.
+
+8. After the password rotation in STEP 05, the user still got `Access denied`
+   from the top-right form with the new password. The user then clicked
+   "I'm an agent - sign in here" and the same credentials worked. That was the
+   decisive test.
+
+WHAT WENT WRONG
+
+The account and the password file were valid. The exact 32-character value
+from `admin_password.txt` returned status 302 on `/scp/login.php` and updated
+`lastlogin`. The user was submitting the staff credentials to `/login.php`,
+the client portal login. osTicket correctly rejected them because they are not
+client users.
+
+The password whitespace tests were real but irrelevant to this incident. A
+trailing space or newline does produce `Access denied`, and the username is
+trimmed by osTicket. That made "copy problem" look plausible, but the actual
+browser request was going to the wrong form.
+
+`Access denied` is an authentication failure. In this case it was an
+authentication failure against the wrong user store, not a bad password.
+
+WHAT I ASSUMED WRONGLY
+
+1. I assumed the top-right "Sign In" was the staff login. It is the client
+   portal login. The staff link is the smaller "I'm an agent - sign in here"
+   link on that page.
+
+2. I assumed the browser was sending a different value than the file. The exact
+   file worked on `/scp/login.php`; the missing variable was the endpoint, not
+   the password.
+
+3. I assumed a password rotation was a reasonable next step before proving
+   which login form the user was on. That changed a working credential and did
+   not address the actual problem.
+
+4. I assumed `ost_syslog` would contain failed login entries. It only had the
+   installation entry. The database `lastlogin` field and the HTML links were
+   more useful.
+
+DEAD ENDS
+
+- Copying the password again, trying another editor and trying another browser
+  did not fix the top-right form. The form was the problem, not the copy.
+
+- Looking in `ost_syslog` for failed logins was a dead end. The table had only
+  the installation message.
+
+- Resetting the admin password before identifying the login form was a dead
+  end. The exact secret already authenticated successfully on the agent
+  endpoint.
+
+- Blaming nginx or the proxy was a dead end. `curl --resolve` returned 200 and
+  the agent login page rendered with the correct title and CSRF token.
+
+- Changing DNS again was a dead end. The main PC could already load the page
+  through the hosts entry. The remaining error was after the page loaded.
+
+- Testing the username with a trailing space did not reproduce the error. It
+  succeeded because osTicket trims the username.
+
+HOW I DIAGNOSED IT
+
+I started from the status code, not from the message alone. The AJAX login
+returns HTTP 200 even when authentication fails, so the useful value is the
+JSON `status` field. The exact secret returned `status:302` on the agent
+endpoint. The wrong password, the trailing space and the trailing newline
+returned `status:401` with `Access denied`.
+
+I then checked `lastlogin` in `ost_staff`. The exact login changed it to
+13:51:41. The user's attempts had left it at 13:10:07. This confirmed that no
+successful authentication had happened from the user's form.
+
+The decisive evidence was the page HTML. The top-right "Sign In" points to
+`/login.php`. The text "I'm an agent" on that page points to `/scp/`. The agent
+form is `/scp/login.php`. The user confirmed that the agent link works and the
+top-right form does not. That isolated the problem to the entry point.
+
+HOW I FIXED IT
+
+The fix is the agent login:
+
+    http://tickets.home.arpa/scp/login.php
+
+or, from the client page, the link:
+
+    I'm an agent - sign in here
+
+Do not use the top-right "Sign In" for staff credentials. The username is
+`homelab-admin`. The current password is in
+`compose/secrets/admin_password.txt` and must not be printed into a terminal
+log, a ticket or the repository.
+
+The password rotation in STEP 05 is still active, but it was not the fix. The
+old password was valid on the agent form; it is invalid now only because it was
+rotated. The current 20-character value works on the agent form.
+
+HOW I VERIFIED IT
+
+The exact secret, sent the same way as the browser AJAX login to
+`/scp/login.php`, returned:
+
+    http=200
+    "status":302
+
+The `lastlogin` field changed to `2026-10-21 13:51:41` after the diagnostic
+test and to `2026-10-21 14:06:53` after the rotated-password test.
+
+The negative tests returned:
+
+    wrong password:            "status":401  "message":"Access denied"
+    exact secret + space:      "status":401  "message":"Access denied"
+    exact secret + newline:    "status":401  "message":"Access denied"
+    username + trailing space: "status":302
+
+The admin row remained active and admin:
+
+    staff_id 1, username homelab-admin, isactive 1, isadmin 1, change_passwd 0
+
+The current password file reports 20 bytes, 20 characters, mode 600 and no edge
+whitespace. The agent login through nginx returns 302 to `index.php` and the
+dashboard marker is present. The user confirmed that the agent link works in
+the browser.
+
+No password, hash or session cookie was written to this journal.
+
+ROLLBACK
+
+No server change was made in the diagnosis. There is nothing to roll back for
+the diagnosis itself.
+
+The password rotation is documented in STEP 05. If the rotated password is not
+wanted, restore the old database hash and the old secret file together, then
+verify login. Do not restore only one side.
+
+LESSON LEARNED
+
+`Access denied` is an authentication failure. It does not automatically mean
+the account is locked, the proxy is broken or the database is corrupt.
+
+Confirm which login form and URL the user is on before resetting a credential.
+osTicket has separate client and agent logins. Staff credentials on
+`/login.php` produce the same `Access denied` message as a wrong password.
+
+The exact secret worked on the agent endpoint. The browser did not. The
+difference was the endpoint, not the value. Reproduce the user's URL, not only
+the application's authentication function.
+
+The `lastlogin` column is useful evidence. It updates only on a successful
+authentication and is more reliable than a generic error message.
+
+Password values are whitespace-sensitive. A trailing space or newline is
+enough to get `Access denied`. That is still worth checking after the correct
+form is confirmed.

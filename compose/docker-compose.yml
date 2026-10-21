@@ -1,0 +1,121 @@
+name: ticket-system
+
+services:
+  db:
+    image: mariadb:11.8.9@sha256:f16d7a344413e519dff518f27bdb221388f84b0d274c97c4fb5f2cb0dc1b34fa
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      MARIADB_DATABASE: ${DB_NAME}
+      MARIADB_USER: ${DB_USER}
+      MARIADB_PASSWORD_FILE: /run/secrets/db_password
+      MARIADB_ROOT_PASSWORD_FILE: /run/secrets/db_root_password
+      TZ: ${TZ}
+    secrets:
+      - db_password
+      - db_root_password
+    volumes:
+      - db_data:/var/lib/mysql
+      - ./mariadb.cnf:/etc/mysql/conf.d/zz-homelab.cnf:ro
+    networks:
+      - backend
+    mem_limit: 512m
+    cpus: "1.0"
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges=true
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  osticket:
+    image: hlhd/osticket:v1.18.4@sha256:d115c1a73cafb790ca730e8805178c92484974ceab4f6109dd2a6c71b55e68f4
+    restart: unless-stopped
+    stop_grace_period: 20s
+    depends_on:
+      db:
+        condition: service_healthy
+    user: "1000:1000"
+    environment:
+      DB_HOST: db
+      DB_PORT: "3306"
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PREFIX: ${DB_PREFIX}
+      DB_PASS_FILE: /run/secrets/db_password
+      INSTALL_SECRET_FILE: /run/secrets/install_secret
+      ADMIN_PASS_FILE: /run/secrets/admin_password
+      INSTALL_NAME: ${INSTALL_NAME}
+      INSTALL_EMAIL: ${INSTALL_EMAIL}
+      INSTALL_URL: ${INSTALL_URL}
+      INSTALL_LANG: ${INSTALL_LANG}
+      ADMIN_FIRSTNAME: ${ADMIN_FIRSTNAME}
+      ADMIN_LASTNAME: ${ADMIN_LASTNAME}
+      ADMIN_EMAIL: ${ADMIN_EMAIL}
+      ADMIN_USER: ${ADMIN_USER}
+      TZ: ${TZ}
+      PHP_MEMORY_LIMIT: ${PHP_MEMORY_LIMIT}
+      PHP_UPLOAD_MAX_SIZE: ${PHP_UPLOAD_MAX_SIZE}
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES}
+      REALIP_HEADER: ${REALIP_HEADER}
+    secrets:
+      - db_password
+      - install_secret
+      - admin_password
+    networks:
+      - homelab
+      - backend
+    mem_limit: 900m
+    cpus: "1.0"
+    pids_limit: 256
+    read_only: true
+    tmpfs:
+      - /run/osticket:rw,noexec,nosuid,size=64m,uid=1000,gid=0,mode=770
+      - /tmp:rw,noexec,nosuid,size=64m,mode=1777
+    volumes:
+      - ./php-hardening.ini:/usr/local/etc/php/conf.d/zz-hardening.ini:ro
+      - ./php-fpm.conf:/usr/local/etc/php-fpm.d/zz-osticket.conf:ro
+    security_opt:
+      - no-new-privileges=true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null \"http://127.0.0.1:8080/scp/login.php\" || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  homelab:
+    external: true
+    name: homelab
+  backend:
+    internal: true
+
+volumes:
+  db_data:
+    name: ticket-system-db-data
+
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt
+  db_root_password:
+    file: ./secrets/db_root_password.txt
+  install_secret:
+    file: ./secrets/install_secret.txt
+  admin_password:
+    file: ./secrets/admin_password.txt

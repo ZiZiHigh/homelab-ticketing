@@ -1,0 +1,352 @@
+HOMELAB-TICKETING CHANGELOG
+===========================
+
+What this file is: chronological log of the osTicket deployment on the
+homelab Arch server. Last updated: 2026-10-21. Each block lists the step,
+what changed, why, the evidence and how to undo it. Failures stay in.
+
+Format: [YYYY-MM-DD HH:MM] short title
+        What / Why / How / Validate / Undo / Note
+
+Entries are added after every step. The detailed version of a hard step is in
+journal/NN-short-name.txt. No secrets, passwords or tokens belong here.
+
+Correction note (2026-10-21 14:25): The 13:55 and 14:08 entries below
+misidentified the Access denied cause. The latest entry at the end of this
+file has the corrected root cause: the user was on the client sign-in form,
+not the agent form. Read that entry first. The old entries are kept because
+this is a chronological log.
+
+-------------------------------------------------------------------------------
+
+[2026-10-20 18:55] Phase A pre-flight started
+What:     Read the existing audit, changelog, Compose files and live nginx
+          configuration. Measured Docker, network, RAM, disk and AD state.
+          Nothing was changed.
+Why:      The new project must not break the running homelab services, and
+          the plan has to match the host as it is, not as the old README
+          describes it.
+How:      Read ~/homelab-audit/2026-10-20/00-SUMMARY.txt and the last entries
+          of CHANGELOG.txt. Ran docker ps, docker network inspect, docker
+          stats, nginx -t and nginx -T inside the nginx container. Checked
+          Samba with samba-tool domain info. Researched the current osTicket
+          and FreeScout images.
+Validate: Docker active, 7 containers healthy, shared network homelab
+          (172.20.0.0/16), only nginx publishes 80 and 443. Host nginx does
+          not exist; the proxy is the container homelab-nginx-nginx-1.
+          osTicket upstream is 1.18.4 with no official Docker image. The
+          user chose option A, hlhd/osticket:v1.18.4.
+Undo:     No change on the host. Only the new empty directory
+          ~/ticket-system was created.
+Note:     Details: journal/00-preflight.txt. The base DN for LDAP was not
+          read yet because ldapsearch is not installed.
+
+-------------------------------------------------------------------------------
+
+[2026-10-20 19:05] Repository skeleton and pre-flight journal
+What:     Created ~/ticket-system with README, MIT LICENSE, .gitignore,
+          CHANGELOG, compose/, docs/, journal/ and screenshots/. Wrote
+          journal/00-preflight.txt with the full A1 and A2 work log. Ran
+          git init -b main. No commit and no push.
+Why:      The project needs a clean, separate repository. The pre-flight log
+          must exist before the first install step, including the failed
+          docker command and the nginx mismatch.
+How:      mkdir for the tree, git init, then wrote the files. The README says
+          Status: pre-flight and records the chosen image
+          hlhd/osticket:v1.18.4. The journal follows the fixed structure and
+          includes the exact errors and sanitized outputs.
+Validate: find shows the expected tree. git status shows five untracked
+          entries, no commit yet. grep for em dash and the banned word list
+          returns 0 hits in README and CHANGELOG. No passwords, keys, tokens,
+          real LAN addresses or real usernames are in the repository.
+Undo:     Remove ~/ticket-system, only with explicit approval. The host
+          services, nginx, Samba and Docker were not changed.
+Note:     The temporary sudo rule /etc/sudoers.d/90-ticket-project is still
+          active and must be removed at the end of the project. Backup of
+          this file before the edit: CHANGELOG.txt.bak-2026-10-20-a3a4.
+
+-------------------------------------------------------------------------------
+
+[2026-10-20 20:27] Image audit before deployment
+What:     Pulled and audited hlhd/osticket:v1.18.4 by digest
+          sha256:d115c1a73cafb790ca730e8805178c92484974ceab4f6109dd2a6c71b55e68f4.
+          Checked the image contents, application integrity, packages,
+          application dependencies, malware signatures, filesystem hygiene
+          and a real startup with a temporary MariaDB 11.8.9 container. No
+          homelab service, nginx config, Samba setting or DNS record was
+          changed. No deployment was started.
+Why:      The image has no official osTicket backing and the user asked for a
+          malware and functionality check before the first Compose step. A
+          bad image would have forced a switch to a self-built image from the
+          official 1.18.4 zip.
+How:      Pulled the image, read its metadata and Dockerfile, exported the
+          filesystem, compared the core with the official release zip, ran
+          Trivy 0.76.0, ran ClamAV 1.5.4, checked for setuid files, secrets,
+          SSH keys, cron jobs and unexpected users, then started a temporary
+          osTicket and MariaDB stack on an isolated Docker network with no
+          published port. The temporary containers and network were removed
+          afterwards.
+Validate: Image digest matches the pulled artifact. Size 655,326,337 bytes,
+          amd64, user 1000:1000, healthcheck present. Official
+          osTicket-v1.18.4.zip SHA256 is
+          a4187df5f52dd41625e6b61b322245853542e12b5969a45f0a6d81f7ab8151a7;
+          the core diff has only the documented class.auth.php CrowdSec
+          patch, the runtime config symlink, the renamed setup directory and
+          the plugin tree. ClamAV found 0 infected files in 5,648 files and
+          599.44 MiB, and 0 in the 23,417 decompressed PHP source files. The
+          skipped xz file is byte-identical to the official php.net
+          php-8.3.33.tar.xz. Trivy OS found 1 HIGH, 17 MEDIUM, 16 LOW and 2
+          UNKNOWN; application scan found 1 MEDIUM and 1 LOW and 0 secrets.
+          No setuid or setgid files, no world-writable files, no SSH keys, no
+          shell history, no sudoers, no LD_PRELOAD, root locked. The smoke
+          stack became healthy, served /scp/login.php with HTTP 200 and the
+          osTicket agent login title, created the schema and an admin row, and
+          returned healthcheck exit code 0. The 7 homelab containers were
+          still healthy after cleanup.
+Undo:     No homelab change. The temporary smoke containers and network are
+          already gone and no named volume was created. The pulled images and
+          /var/tmp scan artifacts can be removed later only with approval.
+          The repository has no commit yet. Backup before this entry:
+          CHANGELOG.txt.bak-2026-10-20-2018.
+Note:     Verdict: not malware and functionally working, so it is usable for
+          the project with the digest pinned. Residual risks: plugin sources
+          are not pinned to commits, the build does not checksum the osTicket
+          zip, one HIGH pcre2 OS CVE remains, and PHP bundles PCRE2 10.42 with
+          JIT on. A hardening ini with pcre.jit=0 and only the needed LDAP
+          plugins is advisable. Full evidence and the dead ends are in
+          journal/01-image-audit.txt. Deployment decision waits for the user.
+
+-------------------------------------------------------------------------------
+
+[2026-10-21 12:45] Compose stack built, started and verified
+What:     Created the Compose stack, local secret files, PHP/FPM/MariaDB
+          hardening and started osTicket 1.18.4 with MariaDB 11.8.9. The app
+          is healthy, serves /scp/login.php with HTTP 200, and the local admin
+          can log in. No host port was published. No nginx, DNS or Samba
+          change was made.
+Why:      The audited image was ready for a real internal deployment. The
+          first start exposed an osTicket installer rule that rejects the
+          username "admin", so the admin username became "homelab-admin".
+How:      Wrote compose/docker-compose.yml with digest pins, an internal
+          backend network, a named DB volume, file-based secrets, read-only
+          rootfs, cap_drop ALL, tmpfs and resource limits. Generated mode-600
+          secrets with compose/init-secrets.sh. Validated with
+          docker compose config, php-fpm -t and a read-only nginx test.
+          Updated README.md, compose/README.md and journal/02-compose-stack.txt
+          with the running state and the failed first start.
+          Started with docker compose up -d at 12:38:55. The app restart
+          looped with "Bad username". Source inspection found the blocklist
+          in setup_hidden/inc/class.installer.php. Backed up .env and
+          .env.example, changed ADMIN_USER to homelab-admin, recreated only
+          the app container, and it became healthy at 12:42:02.
+Validate: docker compose ps shows db and osticket healthy. App healthcheck
+          exit 0, DB healthcheck exit 0. Internal HTTP from the homelab
+          network returns 200; headers have no X-Powered-By and include CSP,
+          nosniff and XSS protection; the session cookie is HttpOnly and
+          SameSite=Lax. Login POST returns 302 to index.php and the agent
+          dashboard marker is present. DB has 72 tables and one staff row
+          (homelab-admin). helpdesk_url is http://tickets.home.arpa and
+          enable_auto_cron is 0. No published ports: docker port is empty,
+          PortBindings is {}, and ss shows no host listener on 8080 or 3306.
+          Restarting the app keeps one admin row and logs
+          "already installed". Rootfs write fails, /run/osticket write
+          succeeds. PHP hardening values and FPM worker count verified.
+Undo:     cd ~/ticket-system/compose && sudo -n docker compose down
+          keeps the named volume ticket-system-db-data. Do not use down -v
+          without approval. Backups: .env.bak-2026-10-21-1241 and
+          .env.example.bak-2026-10-21-1241.
+Note:     Known warnings: nginx cannot open /var/lib/nginx/logs/error.log on
+          the read-only rootfs, but logs go to stdout and the app is healthy.
+          MariaDB falls back from io_uring to libaio because of host sysctl.
+          The osTicket installer explicitly sets the database and tables to
+          utf8 (utf8mb3) even though the server default is utf8mb4. I did not
+          convert the tables. DNS and the nginx vhost for tickets.home.arpa
+          are still pending. Details: journal/02-compose-stack.txt. Backup
+          before this entry: CHANGELOG.txt.bak-2026-10-21-1246.
+
+-------------------------------------------------------------------------------
+
+[2026-10-21 13:10] Published osTicket through nginx and Samba DNS
+What:     Added an HTTP-only nginx vhost for tickets.home.arpa and created
+          the Samba DNS zone home.arpa with an A record tickets ->
+          192.168.88.32. Changed the new zone's NS and SOA names to
+          dc1.ad.home.arpa so the zone is consistent. The existing
+          ad.home.arpa zone was not changed. The Compose stack, database and
+          admin account were not changed.
+Why:      The application was reachable only as osticket:8080 inside the
+          homelab Docker network. The main PC needed a real name, and the
+          server had to be authoritative for that name.
+How:      Backed up ~/homelab/nginx/nginx.conf to
+          nginx.conf.bak-2026-10-21-1259. Added a port 80 server block for
+          tickets.home.arpa with a proxy to osticket:8080, a 25m body limit,
+          real client IP headers, a Docker resolver upstream and an allow
+          list for localhost, Docker private ranges and 192.168.88.0/24.
+          Ran nginx -t inside homelab-nginx-nginx-1 and reloaded it.
+          Checked Samba DNS with samba-tool dns zonelist -P. The server had
+          only ad.home.arpa, 88.168.192.in-addr.arpa and
+          _msdcs.ad.home.arpa. Created home.arpa with
+          samba-tool dns zonecreate 127.0.0.1 home.arpa -P, added tickets A
+          192.168.88.32 with samba-tool dns add 127.0.0.1 home.arpa tickets
+          A 192.168.88.32 -P, then updated the NS and SOA with
+          samba-tool dns update -P. The option had to come before the
+          positional arguments.
+Validate: nginx -t returned syntax ok and test successful. The nginx
+          container stayed healthy. curl --resolve tickets.home.arpa:80:
+          192.168.88.32 returned 200. Login through the proxy returned 302
+          to index.php and the dashboard marker was found. dig from both
+          127.0.0.1 and 192.168.88.32 returned 192.168.88.32 for
+          tickets.home.arpa. getent hosts returned the same address. The
+          ad.home.arpa SOA and dc1.ad.home.arpa A record still resolved.
+          curl without --resolve returned 200. The final login test returned
+          302 and the dashboard marker. The app log showed the real client
+          address 192.168.88.32. No app or database host port was opened;
+          ss showed only nginx on 80 and 443.
+Undo:     For nginx, restore nginx.conf.bak-2026-10-21-1259, run nginx -t
+          and reload homelab-nginx-nginx-1. For DNS, delete the tickets A
+          record and then delete the home.arpa zone:
+          samba-tool dns delete -P 127.0.0.1 home.arpa tickets A 192.168.88.32
+          and samba-tool dns zonedelete -P 127.0.0.1 home.arpa. Deleting
+          the zone removes only the new parent zone; ad.home.arpa is
+          separate. Flush the DNS cache on the main PC after a rollback.
+Note:     The main PC is NixOS at 192.168.88.247. It must use the Samba DNS
+          server 192.168.88.32 or a hosts entry, because the router at
+          192.168.88.1 returns NXDOMAIN. No client package is needed beyond
+          a browser. The URL is http://tickets.home.arpa, not HTTPS. The
+          main PC side was not verified from the server. Details:
+          journal/03-dns-nginx.txt. Backup before this entry:
+          CHANGELOG.txt.bak-2026-10-21-1307.
+          The earlier preflight entry said no real LAN addresses were in the
+          repository. This step adds 192.168.88.32 and 192.168.88.247 because
+          the client instructions need the actual homelab addresses.
+
+-------------------------------------------------------------------------------
+
+[2026-10-21 13:55] Diagnosed Access denied on the agent login
+What:     Investigated the user's Access denied on the main PC with username
+          homelab-admin and the password from the local admin secret file.
+          No server setting, account, password or database row was changed.
+Why:      The login page loaded through http://tickets.home.arpa but the
+          browser rejected the credentials. The page and the proxy were
+          already known to work, so the failure had to be isolated to the
+          authentication path.
+How:      Confirmed the login page returned 200. Checked ost_staff without
+          reading the password hash: staff_id 1, username homelab-admin,
+          isactive 1, isadmin 1, change_passwd 0. The lastlogin value was
+          still 2026-10-21 13:10:07 from the earlier successful test. Checked
+          the secret file shape without printing it: 32 bytes, 32 characters,
+          no trailing newline, no edge whitespace. Then sent AJAX login
+          requests with the exact secret, a wrong password, the exact secret
+          plus one trailing space, the exact secret plus one newline, and a
+          username with a trailing space. Each request used a fresh login page
+          and CSRF token. Also queried ost_syslog for failed login records.
+Validate: Exact secret returned http=200 and JSON "status":302; lastlogin
+          changed to 2026-10-21 13:51:41. Wrong password returned
+          "status":401 and "message":"Access denied". Exact secret plus space
+          returned the same 401. Exact secret plus newline returned the same
+          401. Username plus trailing space returned 302, so the username is
+          trimmed and was not the problem. ost_syslog contained only the
+          installation entry, so it was not useful for failed logins. The
+          account stayed active and admin. No password, hash or session cookie
+          was printed.
+Undo:     No server change was made. If a password reset is needed later,
+          back up the old database hash and the old secret file, then update
+          both together with explicit approval. Do not change only one of
+          them.
+Note:     The exact secret works. The likely cause is a trailing space or
+          newline from copying, or a saved browser autofill value. The
+          username is trimmed by osTicket, the password is not. Copy the
+          32-character value from an editor, clear the saved password and try
+          a private window. Details: journal/04-login-access-denied.txt. The
+          client procedure is also in README.md. Backup before this entry:
+          CHANGELOG.txt.bak-2026-10-21-1353.
+
+-------------------------------------------------------------------------------
+
+[2026-10-21 14:08] Rotated the admin password after repeated Access denied
+What:     Rotated the local administrator password for homelab-admin after the
+          old 32-character value still produced Access denied in the user's
+          browser. Updated the ost_staff hash and the local secret file
+          together. The new secret is 20 characters, lowercase letters and
+          digits, with no trailing newline. No password or hash was printed.
+Why:      The old value authenticated from the server with status 302 and
+          updated lastlogin, but the user could not authenticate from Brave
+          or Firefox after copying it from a local .txt file, from nano and
+          from cat. The old account was active and admin. The remaining
+          problem was in the client input path, so a controlled rotation was
+          the practical fix. The user approved it.
+How:      Checked osTicket auth: Staff::check_passwd() calls Passwd::cmp();
+          class.passwd.php uses include/PasswordHash.php (phpass); the old
+          hash was $2a$ and 60 characters. Backed up the old secret file with
+          mode 600 and saved the old hash only in a mode-600 temporary file.
+          Generated a 20-character password from lowercase letters and digits,
+          excluding i, l, o, 0 and 1. Generated the new hash with osTicket's
+          Passwd::hash($new, 10) and checked it with Passwd::cmp() before the
+          DB update. Updated ost_staff.passwd for staff_id 1 and set
+          change_passwd = 0. Replaced secrets/admin_password.txt in place with
+          mode 600 so the container secret bind mount also reported 20 bytes.
+Failures: The first generator pipeline exited 141 because set -o pipefail
+          turned a normal SIGPIPE from "tr | head" into a failure. No DB or
+          secret change occurred. The second attempt failed at
+          "docker compose cp" with "container rootfs is marked read-only". No
+          DB or secret change occurred. The working copy path was
+          "docker compose exec -T -u root osticket sh -c 'umask 077; cat >
+          /tmp/new_password'" with the password on stdin.
+Validate: New secret: 20 bytes, 20 characters, mode 600, no edge whitespace.
+          Container secret: /run/secrets/admin_password 20 bytes. DB row:
+          staff_id 1, homelab-admin, isactive 1, isadmin 1, change_passwd 0,
+          hash prefix $2a$, hash length 60. New AJAX login: HTTP 200 with
+          JSON "status":302; lastlogin changed to 2026-10-21 14:06:53. Old
+          backup login: HTTP 200 with JSON "status":401 and "message":"Access
+          denied". ticket-system-db-1 and ticket-system-osticket-1 healthy.
+Undo:     Old secret file backup is at
+          compose/secrets/admin_password.txt.bak-2026-10-21-1406 with mode 600.
+          The old database hash was kept only in a mode-600 temporary file and
+          removed after verification. To roll back, hash the old password with
+          Passwd::hash(), update ost_staff.passwd for staff_id 1, restore the
+          old secret file and set mode 600, then verify login. Do not restore
+          only one side.
+Note:     The current password is only in compose/secrets/admin_password.txt.
+          The old local .txt copy is invalid. The old value no longer
+          authenticates. The user should clear saved browser passwords and use
+          a private window for the next test. The full work log is in
+          journal/05-admin-password-rotation.txt; the earlier diagnosis is in
+          journal/04-login-access-denied.txt. Backup before this entry:
+          CHANGELOG.txt.bak-2026-10-21-1407.
+
+-------------------------------------------------------------------------------
+
+[2026-10-21 14:25] Corrected the Access denied root cause: wrong sign-in form
+What:     Corrected the diagnosis and the documentation. The user was using the
+          top-right "Sign In" link, which goes to /login.php (the client
+          portal), with the staff account. Staff use /scp/login.php, reached
+          from "I'm an agent - sign in here". The password was valid. The
+          rotation in the previous entry was not the fix and is retained only
+          because it is already verified.
+Why:      The previous entries treated the browser failure as a password copy
+          or autofill problem. The user confirmed that the agent link works and
+          the top-right form does not. The page HTML showed the two paths:
+          / contains <a href="/login.php">Sign In</a>, and /login.php contains
+          "I'm an agent" pointing to /scp/.
+How:      Rechecked the login page HTML without printing any credential. The
+          agent endpoint accepted the exact secret with status 302; the client
+          form is for client portal users and rejects staff credentials. The
+          current 20-character password works on /scp/login.php. Updated
+          README.md, journal/03-dns-nginx.txt (hosts entry, not global DNS),
+          journal/04-login-access-denied.txt, journal/05-admin-password-
+          rotation.txt and compose/README.md. Added docs/architecture.md with
+          the network, request, secret and failure-domain diagrams.
+Validate: The user confirmed that the agent link works. GET /scp/login.php
+          returns 200; the agent login returns 302 and the dashboard marker.
+          The top-right client form rejects the staff account. The current
+          secret file is 20 bytes, mode 600 and ignored by Git. The old
+          32-character backup returns 401. No secret value was printed.
+Undo:     No new server change. The password rotation remains in place. If the
+          old credential is required, restore the old database hash and the old
+          secret file together and verify the agent login. Do not restore only
+          one side.
+Note:     The actual user-facing fix is the URL: use
+          http://tickets.home.arpa/scp/login.php, not the top-right Sign In.
+          The main PC keeps its normal DNS and uses one hosts entry for
+          tickets.home.arpa. The Samba A record is still present for clients
+          that use Samba DNS. Backup after this entry:
+          CHANGELOG.txt.bak-2026-10-21-1425.
