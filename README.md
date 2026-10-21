@@ -54,9 +54,9 @@ It did find residual CVE and supply-chain risks, which are listed in
 [Limitations](#limitations-and-next-steps) and in
 [journal/01-image-audit.txt](journal/01-image-audit.txt).
 
-All addresses in this repository are RFC1918 lab addresses or documentation
-ranges. They are not reachable from the internet. Change them before reusing
-the configuration elsewhere.
+All addresses in this repository are RFC1918 lab addresses, loopback
+addresses, or documentation ranges. They are not reachable from the internet.
+Change them before reusing the configuration elsewhere.
 
 ## Architecture
 

@@ -45,9 +45,11 @@ Note:     Details: journal/00-preflight.txt. The base DN for LDAP was not
 
 [2026-10-20 19:05] Repository skeleton and pre-flight journal
 What:     Created ~/ticket-system with README, MIT LICENSE, .gitignore,
-          CHANGELOG, compose/, docs/, journal/ and screenshots/. Wrote
-          journal/00-preflight.txt with the full A1 and A2 work log. Ran
-          git init -b main. No commit and no push.
+          CHANGELOG, compose/, docs/, journal/ and a screenshots/ placeholder.
+          Wrote journal/00-preflight.txt with the full A1 and A2 work log. Ran
+          git init -b main. No commit and no push. The empty screenshots/
+          placeholder was removed before publication; the diagrams live in
+          README.md and docs/architecture.md.
 Why:      The project needs a clean, separate repository. The pre-flight log
           must exist before the first install step, including the failed
           docker command and the nginx mismatch.
