@@ -378,3 +378,22 @@ Note:     The client form verifies the e-mail domain. home.arpa has no A or MX
           record, so an internal address is rejected with "Enter a valid
           email address". For the demo data the check was disabled and then
           restored to its previous state; see the limitations in README.md.
+
+[2026-11-21 17:40] Add worked sample tickets and a desk guide
+What:     Added tickets/ with three simulated tickets (printer offline,
+          expired password, slow network), tickets/README.md, and
+          docs/troubleshooting-guide.md. README gained a Sample tickets
+          section, a Troubleshooting guide section and two repository-map
+          rows.
+Why:      The deployment proves the stack runs. These files show how the
+          queue is actually worked: what the user says, what gets checked,
+          what the evidence means, and what the next person needs to know.
+How:      Each ticket follows the same shape: user's own words, ordered
+          checks, finding, fix, verification, and what to do differently.
+          The guide is written for a new colleague, not as a manual: first
+          questions, symptom-to-check tables, Windows/Linux commands, when
+          to escalate and how to write the note.
+Validate: Ticket numbers 471582 and 267572 match the live queue in the
+          screenshots; 918204 is an extra sample. All names and details are
+          invented. No real user data, password or token is in the files.
+Undo:     git revert this commit. Nothing on the running stack changes.

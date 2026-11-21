@@ -21,6 +21,8 @@ project, not a production deployment. Last verified: 2026-11-12.
 - [The two sign-in forms](#the-two-sign-in-forms)
 - [What I verified](#what-i-verified)
 - [Screenshots](#screenshots)
+- [Sample tickets](#sample-tickets)
+- [Troubleshooting guide](#troubleshooting-guide)
 - [Security posture](#security-posture)
 - [Problems and fixes](#problems-and-fixes)
 - [Run it](#run-it)
@@ -195,6 +197,27 @@ how the stack behaves with traffic in it. No password or token is visible.
 
 Captions and what each image proves: [`docs/screenshots/`](docs/screenshots/README.md).
 
+## Sample tickets
+
+Three worked tickets in [`tickets/`](tickets/README.md). Each one has the
+user's own words, the checks in the order I ran them, the evidence, the fix and
+what I would do differently. They are simulated, not customer data, and two of
+the numbers match the queue in the screenshots.
+
+| Ticket | Topic | What it is really about |
+|---|---|---|
+| [471582](tickets/471582-printer-offline.md) | Printer does not print | Scope, stuck queues and a printer that moved on DHCP |
+| [267572](tickets/267572-password-expired.md) | Cannot log in | Expired password, phone lockout and cached credentials at home |
+| [918204](tickets/918204-slow-network.md) | Everything is slow | Ping by address versus by name, and a stale VPN resolver |
+
+## Troubleshooting guide
+
+[`docs/troubleshooting-guide.md`](docs/troubleshooting-guide.md) is the
+cheatsheet I would hand to the next person on the desk: the five questions to
+ask first, what to check when the user says "I cannot log in", "the printer does
+not print" or "everything is slow", Windows and Linux commands side by side,
+when to escalate, and how to write a note that someone else can pick up.
+
 ## Security posture
 
 | Control | Implementation |
@@ -283,6 +306,8 @@ client form.
 | [`README.md`](README.md) | Project summary, diagrams, verification and failure log |
 | [`docs/architecture.md`](docs/architecture.md) | Network zones, request path, secrets flow and trade-offs |
 | [`docs/screenshots/`](docs/screenshots/README.md) | Agent dashboard, open queue and user directory |
+| [`tickets/`](tickets/README.md) | Three worked sample tickets with diagnostics and lessons |
+| [`docs/troubleshooting-guide.md`](docs/troubleshooting-guide.md) | Desk cheatsheet: symptom, checks, escalation, notes |
 | [`compose/`](compose/) | Compose stack, PHP/FPM/MariaDB hardening, secret bootstrap, runbook |
 | [`nginx/`](nginx/) | Reference osTicket vhost |
 | [`journal/`](journal/) | Chronological work logs with exact errors and commands |
