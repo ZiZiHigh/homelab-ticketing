@@ -19,7 +19,7 @@ written example too.
 | Ticket | Topic | Why it is here |
 |---|---|---|
 | [471582](471582-printer-offline.md) | Printer does not print | Scope, queues and a DHCP address that moved |
-| [267572](267572-password-expired.md) | Cannot log in | Lockout, expired password and cached credentials at home |
+| [267572](267572-account-locked.md) | Cannot log in | Lockout, expired password and cached credentials at home |
 | [918204](918204-slow-network.md) | Everything is slow | Ping by address versus by name, and stale VPN DNS |
 
 The companion cheatsheet is

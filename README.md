@@ -207,7 +207,7 @@ the numbers match the queue in the screenshots.
 | Ticket | Topic | What it is really about |
 |---|---|---|
 | [471582](tickets/471582-printer-offline.md) | Printer does not print | Scope, stuck queues and a printer that moved on DHCP |
-| [267572](tickets/267572-password-expired.md) | Cannot log in | Expired password, phone lockout and cached credentials at home |
+| [267572](tickets/267572-account-locked.md) | Cannot log in | Expired password, phone lockout and cached credentials at home |
 | [918204](tickets/918204-slow-network.md) | Everything is slow | Ping by address versus by name, and a stale VPN resolver |
 
 ## Troubleshooting guide
