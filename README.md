@@ -11,7 +11,7 @@ email are deliberately out of scope.
 
 **Status:** working on the private LAN. The agent login has been verified.
 LDAP and the osTicket cron worker are not implemented yet. This is a lab
-project, not a production deployment. Last verified: 2026-10-21.
+project, not a production deployment. Last verified: 2026-11-12.
 
 ## Contents
 
@@ -20,6 +20,7 @@ project, not a production deployment. Last verified: 2026-10-21.
 - [Request path](#request-path)
 - [The two sign-in forms](#the-two-sign-in-forms)
 - [What I verified](#what-i-verified)
+- [Screenshots](#screenshots)
 - [Security posture](#security-posture)
 - [Problems and fixes](#problems-and-fixes)
 - [Run it](#run-it)
@@ -173,11 +174,26 @@ value is in this repository.
 | Restart | app restarts with one admin row and logs `already installed`; database volume survives |
 | Image audit | ClamAV 0 infected; 0 secrets; 0 setuid; 1 HIGH / 17 MEDIUM / 16 LOW / 2 UNKNOWN OS findings; 1 MEDIUM / 1 LOW app findings |
 | Data | 72 tables, one staff row, `helpdesk_url=http://tickets.home.arpa`, `enable_auto_cron=0` |
+| Public ticket form | seven tickets accepted through `open.php`; each created a guest user, a thread and a topic priority |
 
 The full command outputs, including the failed attempts, are in the
 journals. This repository does not contain a test suite or CI. The checks are
 manual commands and recorded output, because the target is an existing
 single-host lab, not a repeatable cloud environment.
+
+## Screenshots
+
+Real captures of the agent panel on 2026-11-12. The ticket data is synthetic:
+the users and messages were created for this repository, so the queue shows
+how the stack behaves with traffic in it. No password or token is visible.
+
+| Dashboard | Open queue |
+|---|---|
+| ![Agent dashboard with ticket activity and department statistics](docs/screenshots/osTicketDashboard.png) | ![Open ticket queue with eight tickets](docs/screenshots/osTicketTickets.png) |
+
+![User directory with the guest accounts created by the public form](docs/screenshots/osTicketUsers.png)
+
+Captions and what each image proves: [`docs/screenshots/`](docs/screenshots/README.md).
 
 ## Security posture
 
@@ -266,6 +282,7 @@ client form.
 |---|---|
 | [`README.md`](README.md) | Project summary, diagrams, verification and failure log |
 | [`docs/architecture.md`](docs/architecture.md) | Network zones, request path, secrets flow and trade-offs |
+| [`docs/screenshots/`](docs/screenshots/README.md) | Agent dashboard, open queue and user directory |
 | [`compose/`](compose/) | Compose stack, PHP/FPM/MariaDB hardening, secret bootstrap, runbook |
 | [`nginx/`](nginx/) | Reference osTicket vhost |
 | [`journal/`](journal/) | Chronological work logs with exact errors and commands |
@@ -291,6 +308,12 @@ client form.
   utf8mb4. The schema was not converted.
 - The main PC keeps its normal resolver and uses one hosts entry. A global DNS
   takeover was rejected because it would break internet and VPN DNS.
+- The client form verifies the e-mail domain (Admin panel, Settings, Email).
+  `home.arpa` has no A or MX record, so a ticket from an internal address is
+  rejected with "Enter a valid email address". The demo tickets were created
+  with that check temporarily disabled and the setting was restored afterwards.
+  A real fix is either an A record for `home.arpa` or turning the check off
+  for the lab.
 
 ## Documentation
 

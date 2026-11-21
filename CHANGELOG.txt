@@ -352,3 +352,29 @@ Note:     The actual user-facing fix is the URL: use
           tickets.home.arpa. The Samba A record is still present for clients
           that use Samba DNS. Backup after this entry:
           CHANGELOG.txt.bak-2026-10-21-1425.
+
+-------------------------------------------------------------------------------
+
+[2026-11-12 20:40] Agent screenshots and a populated queue
+What:     Added docs/screenshots/ with three agent captures and a README with
+          captions. Created seven synthetic tickets and seven guest users so
+          the queue, the user directory and the activity graph show traffic
+          instead of one welcome ticket.
+Why:      One welcome ticket proves that the installer ran. It does not prove
+          that the public form, the database and the agent panel work together.
+How:      Tickets were submitted through the public form at open.php with a
+          session cookie and a CSRF token, which is the path a client uses. No
+          ticket rows were hand-written. Ticket dates were spread over
+          2026-11-04 to 2026-11-12 so the activity graph has shape. The pages
+          were captured with Chromium at 1920x1080.
+Validate: The queue lists eight tickets, two assigned to the agent, and the
+          priority comes from the help topic (access issues are high). The
+          user directory lists seven guest users and the welcome user. No
+          password, token or session id is visible in the images.
+Undo:     git revert this commit, which removes the images and the docs only.
+          The tickets exist in the lab database: delete them in the agent
+          panel, or drop the volume and lose everything.
+Note:     The client form verifies the e-mail domain. home.arpa has no A or MX
+          record, so an internal address is rejected with "Enter a valid
+          email address". For the demo data the check was disabled and then
+          restored to its previous state; see the limitations in README.md.
